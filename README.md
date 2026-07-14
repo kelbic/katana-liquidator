@@ -26,8 +26,9 @@ python3 -m analysis.test_keccak && python3 -m analysis.test_models \
 cd contracts && KATANA_RPC_URL=https://rpc.katana.network ./run_fork_test.sh 1.0
 
 # 3. see what the bot WOULD do, live, against Katana — never sends (DRY_RUN default)
-HEAD=$(cast block-number --rpc-url https://rpc.katana.network)
-DRY_RUN=1 KT_CHECKPOINT_BLOCK=$((HEAD-50000)) python3 -m bot.executor once
+#    Discovery is via the Morpho indexer (current borrowers), so no checkpoint is needed.
+DRY_RUN=1 KT_CONTRACT=0x25b5DeA89c8d337d0B040aBd10f8D69c2DfbCa45 python3 -m bot.executor once
+# -> "block … | positions N | targets(HF<1) K | guard=OK … contract=set" in <10s
 ```
 
 ## Go live — operator steps (the parts that need your key)

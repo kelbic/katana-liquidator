@@ -72,6 +72,18 @@ class TestEvaluate(unittest.TestCase):
         t = _target(1.0, 61000.0)
         self.assertIsNone(ex.evaluate(None, t, gas_usd=0.01))
 
+    def test_none_and_no_chunking_on_no_route(self):
+        # dead/exotic collateral (Sushi NoWay) -> skip immediately, don't try every fraction
+        calls = {"n": 0}
+
+        def q(*a, **k):
+            calls["n"] += 1
+            raise ex.NoRouteError("no route (NoWay)")
+        ex.quote = q
+        t = _target(1.0, 61000.0)
+        self.assertIsNone(ex.evaluate(None, t, gas_usd=0.01))
+        self.assertEqual(calls["n"], 1)   # bailed on the first quote, no chunk-down loop
+
     def test_minprofit_floor_set_for_stable(self):
         ex.quote = _stub_quote(out_per_btc=61500, impact=0.008)
         t = _target(1.0, 61000.0)

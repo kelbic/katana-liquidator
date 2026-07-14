@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -34,6 +35,11 @@ class SushiError(RuntimeError):
     pass
 
 
+class NoRouteError(SushiError):
+    """No swappable route for this pair AT ANY SIZE (Sushi status 'NoWay', or a 4xx validation
+    error for an unsupported/dust token). The caller should skip the target, not chunk down."""
+
+
 def quote(token_in: str, token_out: str, amount_in_wei: int, sender: str, recipient: str,
           max_slippage: float = 0.005, timeout: float = 30.0, retries: int = 3) -> dict:
     """One Sushi v7 quote. Returns a normalised dict:
@@ -41,7 +47,8 @@ def quote(token_in: str, token_out: str, amount_in_wei: int, sender: str, recipi
          swap_target (str), swap_calldata (str 0x-hex), raw}
     `recipient` (to) is baked into the calldata — for the liquidation callback it MUST be the
     KatanaLiquidator contract so the swapped loanToken lands there for Morpho to pull.
-    """
+    Raises NoRouteError (no retry) when there is no route / an unsupported token (status 'NoWay'
+    or HTTP 4xx) — retrying those is pointless. Retries only transient network/5xx errors."""
     params = {
         "tokenIn": token_in, "tokenOut": token_out, "amount": str(int(amount_in_wei)),
         "maxSlippage": str(max_slippage), "sender": sender, "to": recipient,
@@ -54,6 +61,9 @@ def quote(token_in: str, token_out: str, amount_in_wei: int, sender: str, recipi
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 d = json.loads(r.read())
             if d.get("status") != "Success":
+                # NoWay = no route at all; treat as fail-fast so the caller skips the target.
+                if d.get("status") == "NoWay":
+                    raise NoRouteError("no route (NoWay)")
                 raise SushiError(f"status={d.get('status')} {str(d)[:160]}")
             tx = d.get("tx") or {}
             return {
@@ -67,6 +77,12 @@ def quote(token_in: str, token_out: str, amount_in_wei: int, sender: str, recipi
             }
         except SushiError:
             raise
+        except urllib.error.HTTPError as e:
+            # 4xx = the request/token is invalid — retrying won't help; skip the target.
+            if 400 <= e.code < 500:
+                raise NoRouteError(f"HTTP {e.code} (unsupported token/amount)") from e
+            last = e
+            time.sleep(0.5 * (attempt + 1))
         except (OSError, ValueError) as e:
             last = e
             time.sleep(0.5 * (attempt + 1))

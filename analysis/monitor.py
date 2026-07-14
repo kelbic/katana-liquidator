@@ -25,6 +25,7 @@ import time
 
 from analysis.keccak import selector
 from analysis.models import lif_from_lltv, morpho_health_factor, shares_to_assets_up
+from analysis.morpho_api import fetch_candidates
 from analysis.multicall import multicall
 from analysis.protocols import (MORPHO, STABLES, TOKENS, TOPIC_MORPHO_BORROW,
                                 TOPIC_MORPHO_LIQUIDATE, decode_morpho_borrow,
@@ -36,11 +37,19 @@ SEL_MARKET = selector("market(bytes32)")
 SEL_ID_TO_MARKET_PARAMS = selector("idToMarketParams(bytes32)")
 SEL_PRICE = selector("price()")
 
-# Katana Morpho was deployed well before we started watching; discovery walks from the first
-# block we care about. 0 is safe (full history) but slow; the executor overrides with a recent
-# checkpoint. Public Katana RPC accepts wide getLogs windows.
+# --- discovery -----------------------------------------------------------------
+# Position book = CURRENT borrowers from the Morpho indexer (analysis.morpho_api), NOT a
+# getLogs scan from block 0 (impractical on a 37M-block chain via the public RPC — it truncates
+# wide chunked responses and is very slow). The API returns the near-edge set (HF <= ceiling)
+# instantly; exact trigger HF is still computed on-chain here via multicall.
+DISCOVERY = os.environ.get("KT_DISCOVERY", "api")     # "api" (default) | "logs"
+API_HF_CEILING = float(os.environ.get("KT_API_HF_CEILING", "1.15"))
 DEPLOY_BLOCK = int(os.environ.get("KT_DEPLOY_BLOCK", "0"))
-LOG_CHUNK = int(os.environ.get("KT_LOG_CHUNK", "500000"))
+LOG_CHUNK = int(os.environ.get("KT_LOG_CHUNK", "50000"))
+# bounded window (in blocks back from head) for OPTIONAL supplements: fresh Borrows between API
+# refreshes, and real Liquidate events for the CLI fidelity log. 0 = skip getLogs entirely.
+INCR_WINDOW = int(os.environ.get("KT_INCR_WINDOW", "0"))
+LIQ_LOG_WINDOW = int(os.environ.get("KT_LIQ_LOG_WINDOW", "0"))
 
 WATCH_HF = 1.05         # positions below this form the watch set
 REPORT_HF = 1.15        # risk table cutoff
@@ -137,26 +146,67 @@ def _bucket(hf: float) -> str:
 
 
 # --- core scan (shared by CLI + executor) --------------------------------------
-def scan(rpc: Rpc | None = None, state: dict | None = None,
-         min_debt_usd: float = MIN_DEBT_USD, report_hf: float = REPORT_HF) -> dict:
-    """One incremental pass. Returns:
-        {block, targets:[...HF<1...], risk:[...HF<report_hf...], liquidations:[...since ckpt],
-         state} — the executor uses `targets`; the CLI logs `risk` + `liquidations`.
-    Each target/risk row carries the on-chain amounts needed to size a liquidation."""
-    rpc = rpc or Rpc()
-    state = state if state is not None else load_state()
-    frm, to = state["last_block"] + 1, rpc.block_number()
-    if to < frm:
-        to = frm  # single-block pass
+def discover(rpc: Rpc, state: dict, to: int, hf_ceiling: float = API_HF_CEILING,
+             market_ids: set[str] | None = None) -> tuple[dict, list]:
+    """Build the candidate book {market_id: set(borrowers)}. Default mode "api": current
+    near-edge borrowers from the Morpho indexer (instant, no historical scan). Mode "logs":
+    incremental Borrow logs over a BOUNDED recent window only (never from block 0). Also returns
+    real Liquidate events over an optional bounded window (CLI fidelity log; empty by default).
+    On API failure, falls back to a bounded incremental-logs window so the pass still runs."""
+    liquidations: list = []
 
-    # 1. discovery + real liquidations since checkpoint
-    borrow_logs = get_logs_chunked(rpc, MORPHO, [TOPIC_MORPHO_BORROW], frm, to, chunk=LOG_CHUNK)
-    pairs = {m: set(bs) for m, bs in state["pairs"].items()}
-    for lg in borrow_logs:
+    if DISCOVERY == "api":
+        # fresh near-edge set each pass — the indexer already tracks the current book, so we do
+        # NOT accumulate stale (cured) borrowers across passes (keeps the multicall bounded).
+        pairs: dict[str, set] = {}
+        try:
+            api = fetch_candidates(hf_ceiling=hf_ceiling, market_ids=market_ids)
+            for m, bs in api.items():
+                pairs.setdefault(m, set()).update(bs)
+        except Exception as e:
+            print(f"  API discovery failed ({e}); falling back to bounded incremental logs")
+            pairs = {m: set(bs) for m, bs in state.get("pairs", {}).items()}
+            _merge_incremental_logs(rpc, pairs, state, to, window=max(INCR_WINDOW, LOG_CHUNK))
+    else:  # "logs": accumulate from the persisted book + a bounded incremental window (never 0)
+        pairs = {m: set(bs) for m, bs in state.get("pairs", {}).items()}
+        _merge_incremental_logs(rpc, pairs, state, to, window=INCR_WINDOW or LOG_CHUNK)
+
+    # optional: fresh Borrows between API refreshes (bounded small window)
+    if DISCOVERY == "api" and INCR_WINDOW > 0:
+        _merge_incremental_logs(rpc, pairs, state, to, window=INCR_WINDOW)
+
+    # optional: real liquidations for the CLI fidelity log (bounded window; off by default)
+    if LIQ_LOG_WINDOW > 0:
+        frm = max(0, to - LIQ_LOG_WINDOW)
+        liq_logs = get_logs_chunked(rpc, MORPHO, [TOPIC_MORPHO_LIQUIDATE], frm, to, chunk=LOG_CHUNK)
+        liquidations = [decode_morpho_liquidate(l) for l in liq_logs]
+    return pairs, liquidations
+
+
+def _merge_incremental_logs(rpc: Rpc, pairs: dict, state: dict, to: int, window: int) -> None:
+    """Merge Borrow logs from a BOUNDED window (max(checkpoint, head-window)..head) into pairs."""
+    frm = max(state.get("last_block", -1) + 1, to - window if window else to)
+    if frm > to:
+        return
+    for lg in get_logs_chunked(rpc, MORPHO, [TOPIC_MORPHO_BORROW], frm, to, chunk=LOG_CHUNK):
         d = decode_morpho_borrow(lg)
         pairs.setdefault(d["market_id"], set()).add(d["borrower"])
-    liq_logs = get_logs_chunked(rpc, MORPHO, [TOPIC_MORPHO_LIQUIDATE], frm, to, chunk=LOG_CHUNK)
-    liquidations = [decode_morpho_liquidate(l) for l in liq_logs]
+
+
+def scan(rpc: Rpc | None = None, state: dict | None = None,
+         min_debt_usd: float = MIN_DEBT_USD, report_hf: float = REPORT_HF,
+         hf_ceiling: float = API_HF_CEILING, market_ids: set[str] | None = None) -> dict:
+    """One pass. Returns:
+        {block, targets:[...HF<1...], risk:[...HF<report_hf...], liquidations:[...],
+         state} — the executor uses `targets`; the CLI logs `risk` + `liquidations`.
+    Discovery is via the Morpho indexer by default (KT_DISCOVERY=api); exact trigger HF is
+    computed on-chain here. Each target/risk row carries the on-chain amounts to size a liq."""
+    rpc = rpc or Rpc()
+    state = state if state is not None else load_state()
+    to = rpc.block_number()
+
+    # 1. discovery (Morpho indexer by default; bounded logs otherwise) + optional real liqs
+    pairs, liquidations = discover(rpc, state, to, hf_ceiling=hf_ceiling, market_ids=market_ids)
 
     # 2. multicall sweep: params (new mids) -> market state -> positions -> prices
     params = dict(state["params"])
@@ -208,11 +258,14 @@ def scan(rpc: Rpc | None = None, state: dict | None = None,
         else:
             risk.append(row)
 
-    new_state = {"last_block": to,
-                 "pairs": {m: sorted(bs) for m, bs in pairs.items() if bs},
-                 "params": params}
-    return {"block": to, "from_block": frm, "targets": targets, "risk": risk,
-            "liquidations": liquidations, "state": new_state, "n_positions": len(raw_pos)}
+    # Persist the params cache always (immutable, saves re-fetching idToMarketParams). Persist
+    # the pairs book only in logs mode (API mode rediscovers fresh each pass).
+    new_state = {"last_block": to, "params": params,
+                 "pairs": ({m: sorted(bs) for m, bs in pairs.items() if bs}
+                           if DISCOVERY != "api" else state.get("pairs", {}))}
+    return {"block": to, "from_block": state.get("last_block", -1) + 1, "targets": targets,
+            "risk": risk, "liquidations": liquidations, "state": new_state,
+            "n_positions": len(raw_pos)}
 
 
 def run_once(rpc: Rpc | None = None, state_path: str = STATE_PATH,

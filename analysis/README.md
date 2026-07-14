@@ -8,6 +8,7 @@ monad-liquidator research toolkit; verified against Katana mainnet 2026-07-13.
 - `multicall.py`— Multicall3.aggregate3 encoder/decoder (N reads -> 1 round-trip)
 - `models.py`   — Morpho Blue math: LIF from LLTV, HF, shares->assets (mirrors Morpho.sol)
 - `protocols.py`— verified Katana addresses (Morpho, Sushi RP), token + market registry, decoders
-- `monitor.py`  — live position scanner: discover borrowers, compute HF, flag HF<1 targets
+- `morpho_api.py`— Morpho indexer discovery: CURRENT near-edge borrowers (no getLogs-from-0 scan)
+- `monitor.py`  — live position scanner: discover (indexer) -> exact on-chain HF -> flag HF<1 targets
 
 Tests (stdlib, offline): `python3 -m analysis.test_keccak|test_models|test_protocols`

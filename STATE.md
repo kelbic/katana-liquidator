@@ -99,16 +99,18 @@ katana-liquidator/
   analysis/  (READ-ONLY, stdlib)
     rpc.py keccak.py multicall.py models.py   ported infra (Morpho math, offline keccak)
     protocols.py                 VERIFIED Katana addresses + market/token registry + decoders
-    monitor.py                   on-chain HF scanner + liquidation sizing  (= executor's target finder)
+    morpho_api.py                Morpho indexer discovery — CURRENT borrowers, no getLogs-from-0
+    monitor.py                   discovery(api) + on-chain HF scanner + liquidation sizing
   bot/
     sushi.py                     Sushi v7 client: quote + RouteProcessor calldata (atomic exit)
     executor.py                  live loop: scan → evaluate(chunk vs live quote) → sign+broadcast
     deploy.sh run.sh katana-executor.service
 ```
 
-**Flow:** `monitor.scan()` discovers borrowers (Borrow logs, incremental) → multicalls
-position/market/oracle state → computes exact HF (Morpho.sol `_isHealthy` math) → sizes each
-liquidation. The executor `evaluate()`s each HF<1 target against a **live Sushi quote**, picks
+**Flow:** `monitor.scan()` discovers current near-edge borrowers from the **Morpho indexer**
+(`morpho_api.fetch_candidates`, HF ≤ ceiling — instant, no historical getLogs scan) → multicalls
+position/market/oracle state → computes exact trigger HF (Morpho.sol `_isHealthy` math) → sizes
+each liquidation. The executor `evaluate()`s each HF<1 target against a **live Sushi quote**, picks
 the largest chunk whose net clears the floor (chunk-sizing under depth), then `fire()`s an atomic
 `KatanaLiquidator.liquidate()`: Morpho seizes LIF collateral → `onMorphoLiquidate` swaps it via
 the Sushi RouteProcessor → Morpho pulls the repay → surplus swept to owner.
@@ -147,6 +149,18 @@ Hot wallet holds only gas; profit is swept out; contract holds no standing funds
   slippage fear refuted (real quotes: +2.48% net on a $148k exit), gas negligible, zero-capital.
   Built full stack, fork-tested real Morpho + real Sushi. Advisor tool unavailable — proceeded on
   evidence. Left the live deploy + wallet funding to the operator (key custody).
-- **Open follow-ups** (post-deploy, operator's call): seed `KT_CHECKPOINT_BLOCK` for a fast first
-  discovery pass; consider a reactive near-edge poll for the weETH/vbETH cluster (sized small);
-  periodic `sweep(collateralToken)` for dust; watch Sushi CoL depth trend.
+- **2026-07-14** Operator deployed KatanaLiquidator live at
+  `0x25b5DeA89c8d337d0B040aBd10f8D69c2DfbCa45` (owner 0x3E8E…, morpho verified) — contract OK. The
+  live DRY-run then exposed a real gap the fork test couldn't: `monitor.scan()` built the book via
+  `getLogs(Borrow)` from block 0 across a 37M-block chain; the public RPC truncates wide chunked
+  responses (`IncompleteRead`) and it is impractically slow. **Fix:** switched discovery to the
+  **Morpho indexer** (`analysis/morpho_api.py`, `KT_DISCOVERY=api` default) — current near-edge
+  borrowers instantly; exact trigger HF still on-chain. getLogs is now optional and bounded only.
+  Also made `bot/sushi.py` fail-fast on `NoWay`/HTTP-4xx (dead-collateral tokens like yUSD have no
+  Sushi route) via `NoRouteError`, so the executor skips them without retry churn.
+  **Re-tested DRY-run on LIVE `rpc.katana.network`**: `positions 559 | targets(HF<1) 4 | guard=OK
+  | contract=set` in **9s**. The 4 HF<1 targets are all dead-collateral dust (yUSD/sYUSD/wsrUSD,
+  no exit) — correctly skipped; no profitable liquidation is live right now (bursty flow, as
+  expected). The bot will fire the moment a real vbWBTC/vbETH position crosses HF<1.
+- **Open follow-ups** (post-deploy, operator's call): reactive near-edge poll for the weETH/vbETH
+  cluster (sized small); periodic `sweep(collateralToken)` for dust; watch Sushi CoL depth trend.

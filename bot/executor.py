@@ -17,12 +17,17 @@ CAPITAL PROTECTION (multiple independent layers):
   * Chunking: large/thin exits are split into the largest chunk whose net clears the floor;
     the rest is taken on later passes as the position stays underwater.
 
+Discovery: the position book comes from the Morpho indexer (analysis.morpho_api) by default —
+current near-edge borrowers, instantly, NO getLogs scan from block 0 (that is impractical on a
+37M-block chain via the public RPC). Exact trigger HF is still computed on-chain via multicall.
+
 Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFILE
   (~/.katana-bot/key), KT_RPC (write, def rpc.katana.network), KT_READ_RPC (read override, e.g.
   a local anvil fork), KT_MIN_PROFIT_USD (20), KT_MIN_DEBT_USD (500), KT_MAX_SLIPPAGE (0.008),
   KT_MAX_IMPACT (0.02), KT_POLL_SEC (20), KT_MAX_DAILY_GAS_USD (5), KT_MAX_CONSEC_REVERTS (3),
   KT_DEDUP_SEC (300), KT_GAS_LIMIT (1_800_000), KT_CHAIN_ID (747474), KT_PRIORITY_GWEI (0.001),
-  KT_CHECKPOINT_BLOCK (seed discovery near head — REQUIRED for a fast first live pass),
+  KT_DISCOVERY (api [default] | logs), KT_API_HF_CEILING (1.15 — discovery watch ceiling),
+  KT_CHECKPOINT_BLOCK (only for KT_DISCOVERY=logs; the api path needs no checkpoint),
   KT_HEARTBEAT_SEC (86400), KT_RAW_TX (0=cast [default], 1=in-process eth_account), DRY_RUN (1),
   KT_CHAT_ID / telegram env for alerts.
 
@@ -50,7 +55,7 @@ from analysis.models import lif_from_lltv                              # noqa: E
 from analysis.monitor import scan, load_state as load_monitor_state    # noqa: E402
 from analysis.protocols import MORPHO, STABLES, TOKENS                 # noqa: E402
 from analysis.rpc import Rpc                                           # noqa: E402
-from bot.sushi import quote, SWAP_INPUT_HAIRCUT                        # noqa: E402
+from bot.sushi import quote, NoRouteError, SWAP_INPUT_HAIRCUT         # noqa: E402
 
 # --- config -------------------------------------------------------------------
 CONTRACT = os.environ.get("KT_CONTRACT", "")
@@ -183,6 +188,9 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float) -> dict | None:
                       sender=CONTRACT or "0x000000000000000000000000000000000000dEaD",
                       recipient=CONTRACT or "0x000000000000000000000000000000000000dEaD",
                       max_slippage=MAX_SLIPPAGE)
+        except NoRouteError:
+            # no route at any size (dead/exotic collateral, e.g. yUSD) — skip this target
+            return None
         except Exception as e:
             print(f"    quote fail f={f}: {e}")
             continue
