@@ -7,6 +7,7 @@ Katana mainnet: chainId 747474 (0xb67d2), native ETH, ~1s blocks. RPCs verified 
 """
 from __future__ import annotations
 
+import http.client
 import json
 import time
 import urllib.error
@@ -76,7 +77,8 @@ class Rpc:
                 last = e
                 time.sleep(self.backoff_429 * (attempt + 1) if e.code == 429
                            else 0.4 * (attempt + 1))
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError,
+                    http.client.IncompleteRead, http.client.HTTPException) as e:
                 last = e
                 time.sleep(0.4 * (attempt + 1))
         raise RuntimeError(f"rpc exhausted retries: {last}")
@@ -119,7 +121,10 @@ def get_logs_chunked(rpc: Rpc, address, topics, from_block: int, to_block: int,
         hi = min(lo + chunk - 1, to_block)
         try:
             logs = rpc.get_logs(address, topics, lo, hi)
-        except RpcError:
+        except (RpcError, http.client.IncompleteRead, RuntimeError):
+            # RpcError = explicit "range too large"; IncompleteRead/RuntimeError = the public
+            # Katana RPC truncated a big chunked response (or call() exhausted retries on it).
+            # In every case, retry a smaller window before giving up.
             if hi > lo:
                 chunk = max(1000, chunk // 2)
                 continue
