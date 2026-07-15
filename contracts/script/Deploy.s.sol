@@ -12,6 +12,7 @@ contract Deploy is Script {
     address constant MORPHO = 0xD50F2DffFd62f94Ee4AEd9ca05C61d0753268aBc;
 
     function run() external returns (KatanaLiquidator liq) {
+        require(block.chainid == 747474, "not Katana (chainId 747474)");
         vm.startBroadcast();
         liq = new KatanaLiquidator(MORPHO);
         vm.stopBroadcast();

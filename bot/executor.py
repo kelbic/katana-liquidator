@@ -122,7 +122,8 @@ ENV_FILE = os.path.expanduser("~/.claude/channels/telegram/.env")
 CHAT_ID = os.environ.get("KT_CHAT_ID", "")     # empty -> alerts disabled (loud preflight warn)
 
 LIQUIDATE_SELECTOR = selector(
-    "liquidate((address,address,address,address,uint256),address,uint256,address,bytes,uint256)")
+    "liquidate((address,address,address,address,uint256),address,uint256,uint256,"
+    "address,bytes,uint256)")
 SEL_ORACLE_PRICE = selector("price()")
 _DEC = {v["address"].lower(): v["decimals"] for v in TOKENS.values()}
 # chunk fractions tried, largest-first — the largest whose net clears the floor wins.
@@ -277,7 +278,11 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float) -> dict | None:
     seized_full = t["seized_assets"]
     repaid_full = t["repaid_assets"]                # loan assets repaid at full close
     shares_full = t["borrow_shares_repaid"]         # LIVE borrowShares scaled to the close
-    if seized_full <= 0 or shares_full <= 0:
+    # collateral-capped close (deep underwater, repaid bounded by collateral value / LIF):
+    # fire in seizedAssets mode — we pin the seize, Morpho derives repaid at execution price,
+    # so a price tick between scan and inclusion can never Panic(0x11) (review M2).
+    capped = repaid_full < t["debt_assets"]
+    if seized_full <= 0 or (not capped and shares_full <= 0):
         return None
     loan_px = _loan_usd_px(loan)
     # USD profit floor converted into loan wei (stables: $1/token as before; vbETH via ETH_USD)
@@ -289,8 +294,16 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float) -> dict | None:
         seized = seized_full * num // den
         if seized <= 0:
             continue
+        if capped:
+            # 0.3% under the cap so the price-derived repaid keeps headroom vs remaining debt;
+            # the swap input IS the pinned seize — exact, no drift, no extra haircut needed
+            seized_arg = seized * _HAIRCUT_NUM // _HAIRCUT_DEN
+            amount_in = seized_arg
+        else:
+            seized_arg = 0
+            amount_in = seized * _HAIRCUT_NUM // _HAIRCUT_DEN
         try:
-            q = quote(coll, loan, seized * _HAIRCUT_NUM // _HAIRCUT_DEN,
+            q = quote(coll, loan, amount_in,
                       sender=CONTRACT or "0x000000000000000000000000000000000000dEaD",
                       recipient=CONTRACT or "0x000000000000000000000000000000000000dEaD",
                       max_slippage=MAX_SLIPPAGE, timeout=QUOTE_TIMEOUT, retries=QUOTE_RETRIES)
@@ -304,12 +317,18 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float) -> dict | None:
                 return None
             continue
         proceeds = q["amount_out"]
-        # chunk amounts scale EXACTLY with the fraction (floor, against ourselves)
-        repaid = repaid_full * num // den
+        if capped:
+            # repaid is derived by Morpho at execution price; estimate it (ceil, against us)
+            # from the scan price for the profit gate — tx params carry no repaid at all
+            repaid = int(seized_arg * t["price"] / 10 ** 36 / lif) + 1
+        else:
+            # chunk amounts scale EXACTLY with the fraction (floor, against ourselves)
+            repaid = repaid_full * num // den
         net_wei = proceeds - repaid
         net_usd = (net_wei / 10 ** loan_dec * loan_px) - gas_usd if loan_px else None
         row = {"f": num / den, "seized": seized, "repaid_assets": repaid,
-               "repaid_shares": shares_full * num // den,
+               "repaid_shares": 0 if capped else shares_full * num // den,
+               "seized_arg": seized_arg,
                "proceeds": proceeds, "net_wei": net_wei, "net_usd": net_usd,
                "impact": q["price_impact"], "swap_target": q["swap_target"],
                "swap_calldata": q["swap_calldata"], "loan_dec": loan_dec}
@@ -334,12 +353,16 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float) -> dict | None:
 
 # --- calldata + signing --------------------------------------------------------
 def liquidate_calldata(t: dict, ev: dict) -> str:
+    """Exactly one of ev[seized_arg]/ev[repaid_shares] is nonzero (Morpho argument order):
+    repaidShares mode for debt-bound closes, seizedAssets mode for collateral-capped ones
+    (Morpho derives repaid at execution price — no Panic(0x11) on an adverse tick, M2)."""
     from eth_abi import encode
-    types = ["(address,address,address,address,uint256)", "address", "uint256",
+    types = ["(address,address,address,address,uint256)", "address", "uint256", "uint256",
              "address", "bytes", "uint256"]
     mp = (_cs(t["loan"]), _cs(t["coll"]), _cs(t["oracle"]), _cs(t["irm"]), t["lltv"])
-    args = [mp, _cs(t["borrower"]), ev["repaid_shares"], _cs(ev["swap_target"]),
-            bytes.fromhex(ev["swap_calldata"][2:]), ev["min_profit_wei"]]
+    args = [mp, _cs(t["borrower"]), ev.get("seized_arg", 0), ev["repaid_shares"],
+            _cs(ev["swap_target"]), bytes.fromhex(ev["swap_calldata"][2:]),
+            ev["min_profit_wei"]]
     return LIQUIDATE_SELECTOR + encode(types, args).hex()
 
 
@@ -571,7 +594,9 @@ def fire(rpc: Rpc, t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -
     key = f"{t['market_id']}:{t['borrower']}"
     nets = f"${ev['net_usd']:+,.1f}" if ev["net_usd"] is not None else f"{ev['net_wei']} wei"
     if DRY_RUN or not CONTRACT:
-        msg = (f"🧪 DRY_RUN: HF={t['hf']:.4f} chunk={ev['f']:.0%} repaidShares={ev['repaid_shares']} "
+        mode = (f"seizedAssets={ev.get('seized_arg', 0)}" if ev.get("seized_arg")
+                else f"repaidShares={ev['repaid_shares']}")
+        msg = (f"🧪 DRY_RUN: HF={t['hf']:.4f} chunk={ev['f']:.0%} {mode} "
                f"net={nets} impact={ev['impact']*100:.2f}% mkt={t['market_id'][:10]} "
                f"{t['borrower'][:10]}…; NOT sent.")
         print(msg)
@@ -728,7 +753,9 @@ def once(st: dict | None = None, mstate: dict | None = None, skip_api: bool = Fa
             if own:
                 save_state(st)
             raise GuardTripped(reason)
-        t["borrow_shares_repaid"] = _shares_for_repaid(rpc, t)
+        # collateral-capped targets fire in seizedAssets mode — live shares are not needed
+        t["borrow_shares_repaid"] = (0 if t["repaid_assets"] < t["debt_assets"]
+                                     else _shares_for_repaid(rpc, t))
         ev = evaluate(rpc, t, gas_usd)
         if not ev:
             st["declined"][key] = {"ts": now_ts}
@@ -759,13 +786,9 @@ def _shares_for_repaid(rpc: Rpc, t: dict) -> int:
     borrow_shares = int(pos[2 + 64:2 + 128], 16)   # word[1] = borrowShares
     if t["debt_assets"] <= 0:
         return 0
-    shares = borrow_shares * t["repaid_assets"] // t["debt_assets"]
-    if t["repaid_assets"] < t["debt_assets"]:
-        # collateral-capped close (deep underwater): repaid was sized so derived seized ==
-        # collateral EXACTLY at scan price — a hair of adverse price move would push seized
-        # past collateral and Panic(0x11) the tx. Shave 0.5% for headroom (review M2).
-        shares = shares * 995 // 1000
-    return shares
+    # NOTE: collateral-capped closes never reach here — they fire in seizedAssets mode
+    # (evaluate/liquidate_calldata), where Morpho derives repaid at execution price (M2).
+    return borrow_shares * t["repaid_assets"] // t["debt_assets"]
 
 
 def heartbeat(st: dict) -> None:

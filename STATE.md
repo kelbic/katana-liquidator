@@ -208,3 +208,13 @@ Hot wallet holds only gas; profit is swept out; contract holds no standing funds
 Отложено (требует редеплой контракта): M4 авто-sweep collateral-пыли (0.3% сеиза оседает в
 контракте), M2-полный (режим seizedAssets), событие с marketId. Отложено (инфра): WSS/платный
 RPC, параллельный сабмит на несколько ингрессов, нонс-реплейсмент застрявших транз.
+
+**Update 2026-07-15 (3) — M4+M2 контракта: редеплой.** liquidate() принимает
+(seizedAssets, repaidShares) как Morpho (ровно один ненулевой): collateral-capped закрытия
+стреляются режимом seizedAssets (пин сеиза −0.3%, Morpho сам выводит repaid по цене
+исполнения — Panic(0x11) на тике исключён по построению, M2); в конце liquidate() досвипается
+и collateralToken (хэйркат-пыль ~0.3% сеиза больше не копится в контракте, M4). Событие
+Liquidated теперь несёт seized/repaid; setOwner с zero-check; Deploy.s.sol требует chainid
+747474. Бот: LIQUIDATE_SELECTOR 0x79755efe (сверен cast==оффлайн-keccak), evaluate ветвится
+capped/uncapped, _shares_for_repaid без 0.5%-шейва (не нужен). Форк-тесты: 6/6 против
+реального Morpho (вкл. capped-close и dust-sweep); юниты 17/17.

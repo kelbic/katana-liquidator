@@ -65,8 +65,10 @@ contract KatanaLiquidator {
     error CannotRepay();
     error ProfitTooLow(uint256 got, uint256 min);
     error ERC20OpFailed();
+    error ZeroAddress();
 
-    event Liquidated(address indexed borrower, address indexed loanToken, uint256 profit);
+    event Liquidated(address indexed borrower, address indexed loanToken, uint256 profit,
+                     uint256 seizedAssets, uint256 repaidAssets);
     event OwnerChanged(address indexed from, address indexed to);
 
     modifier onlyOwner() {
@@ -87,16 +89,26 @@ contract KatanaLiquidator {
     }
 
     function setOwner(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
         emit OwnerChanged(owner, newOwner);
         owner = newOwner;
     }
 
-    /// @notice Liquidate `borrower` on market `mp`, repaying `repaidShares` of debt, swapping the
-    /// seized collateral to loanToken via `swapTarget`/`swapCallData`. Reverts unless realized
-    /// profit (swept to owner) >= `minProfit`. onlyOwner so swap calldata is always our own.
+    /// @notice Liquidate `borrower` on market `mp`, swapping the seized collateral to loanToken
+    /// via `swapTarget`/`swapCallData`. Exactly ONE of `seizedAssets`/`repaidShares` must be
+    /// nonzero (Morpho enforces this — same argument order as Morpho.liquidate):
+    ///   * repaidShares mode — full/partial closes where debt is the binding side; seized is
+    ///     derived by Morpho at execution price.
+    ///   * seizedAssets mode — collateral-capped closes (deep underwater): we pin the seize and
+    ///     Morpho derives repaid at execution price, so an adverse tick between scan and
+    ///     inclusion can never underflow `position.collateral -= seizedAssets` (Panic 0x11).
+    /// Reverts unless realized profit (swept to owner) >= `minProfit`. onlyOwner so swap
+    /// calldata is always our own. Any collateral left over after the swap (input haircut,
+    /// partial route) is swept to the owner too — nothing accrues in the contract.
     function liquidate(
         MarketParams calldata mp,
         address borrower,
+        uint256 seizedAssets,
         uint256 repaidShares,
         address swapTarget,
         bytes calldata swapCallData,
@@ -112,14 +124,18 @@ contract KatanaLiquidator {
         );
 
         uint256 balBefore = IERC20(mp.loanToken).balanceOf(address(this));
-        // seizedAssets = 0 -> repay `repaidShares`; Morpho seizes the incentivized collateral.
-        IMorpho(MORPHO).liquidate(mp, borrower, 0, repaidShares, data);
+        (uint256 seized, uint256 repaid) =
+            IMorpho(MORPHO).liquidate(mp, borrower, seizedAssets, repaidShares, data);
         uint256 balAfter = IERC20(mp.loanToken).balanceOf(address(this));
 
         profit = balAfter - balBefore;
         if (profit < minProfit) revert ProfitTooLow(profit, minProfit);
         _safeTransfer(mp.loanToken, owner, balAfter); // sweep everything (incl. any prior dust)
-        emit Liquidated(borrower, mp.loanToken, profit);
+        // sweep collateral dust too (swap-input haircut leaves ~0.3% of the seize here every
+        // liquidation — unswept it silently accrues as unhedged inventory)
+        uint256 collLeft = IERC20(mp.collateralToken).balanceOf(address(this));
+        if (collLeft != 0) _safeTransfer(mp.collateralToken, owner, collLeft);
+        emit Liquidated(borrower, mp.loanToken, profit, seized, repaid);
     }
 
     /// @notice Morpho callback: collateral already received; swap it to loanToken and ensure the

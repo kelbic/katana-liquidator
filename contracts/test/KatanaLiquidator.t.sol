@@ -59,6 +59,13 @@ contract MockSwapper {
         coll.transferFrom(msg.sender, address(this), amountIn);
         loan.transfer(msg.sender, amountIn * rate / 1e18);
     }
+    /// Pulls only `bps` of the caller's collateral — models the production path where the
+    /// haircut-baked Sushi amountIn is slightly below the real seized amount, leaving dust.
+    function swapPart(uint256 bps) external {
+        uint256 amountIn = coll.balanceOf(msg.sender) * bps / 10000;
+        coll.transferFrom(msg.sender, address(this), amountIn);
+        loan.transfer(msg.sender, amountIn * rate / 1e18);
+    }
 }
 
 /// @notice Thin standalone probe that reproduces EXACTLY what KatanaLiquidator.onMorphoLiquidate
@@ -137,13 +144,49 @@ contract KatanaLiquidatorForkTest is Test {
 
         uint256 ownerBefore = loan.balanceOf(address(this));
         bytes memory swapData = abi.encodeWithSelector(MockSwapper.swapAll.selector);
-        uint256 profit = liq.liquidate(mp, borrower, uint256(borrowShares), address(swapper), swapData, 0);
+        uint256 profit = liq.liquidate(mp, borrower, 0, uint256(borrowShares), address(swapper), swapData, 0);
 
         (, uint128 sharesAfter,) = morpho.position(id, borrower);
         console.log("profit (loan wei):", profit);
         assertGt(profit, 0, "no profit");
         assertEq(sharesAfter, 0, "debt not cleared");
         assertEq(loan.balanceOf(address(this)) - ownerBefore, profit, "profit not swept");
+    }
+
+    /// M2: seizedAssets mode for collateral-capped closes — we pin the seize, Morpho derives
+    /// repaid at execution price. Deep price drop makes the position collateral-capped
+    /// (coll value < debt * LIF), which in repaidShares mode risks Panic(0x11) on a tick.
+    function testSeizedAssetsModeCappedClose() public {
+        if (!forked) return;
+        oracle.setPrice(1.5e36);               // coll value 150 < debt 170 * LIF 1.0438 -> capped
+        swapper = new MockSwapper(coll, loan, 1.5e18);   // swap at the post-drop price
+        loan.mint(address(swapper), 1_000_000e18);
+
+        (, , uint128 collBefore) = morpho.position(id, borrower);
+        uint256 seizeArg = uint256(collBefore) * 997 / 1000;   // 0.3% headroom, like the bot
+        bytes memory swapData = abi.encodeWithSelector(MockSwapper.swapAll.selector);
+        uint256 profit = liq.liquidate(mp, borrower, seizeArg, 0, address(swapper), swapData, 0);
+
+        (, , uint128 collAfter) = morpho.position(id, borrower);
+        console.log("capped-close profit (loan wei):", profit);
+        assertGt(profit, 0, "no profit");
+        assertEq(uint256(collBefore) - collAfter, seizeArg, "seize mismatch");
+        assertEq(coll.balanceOf(address(liq)), 0, "collateral stuck in contract");
+    }
+
+    /// M4: collateral left after the swap (haircut-baked amountIn < seized) must be swept to
+    /// the owner in the SAME tx — nothing may accrue in the contract between liquidations.
+    function testCollateralDustSweptToOwner() public {
+        if (!forked) return;
+        oracle.setPrice(1.8e36);
+        (, uint128 borrowShares,) = morpho.position(id, borrower);
+        uint256 ownerCollBefore = coll.balanceOf(address(this));
+        // pull only 99.7% of the seized collateral — the production haircut leaves ~0.3% dust
+        bytes memory swapData = abi.encodeWithSelector(MockSwapper.swapPart.selector, uint256(9970));
+        liq.liquidate(mp, borrower, 0, uint256(borrowShares), address(swapper), swapData, 0);
+
+        assertEq(coll.balanceOf(address(liq)), 0, "dust stuck in contract");
+        assertGt(coll.balanceOf(address(this)) - ownerCollBefore, 0, "dust not swept to owner");
     }
 
     /// The minProfit gate must revert the whole tx when the realised surplus is below the floor
@@ -153,8 +196,8 @@ contract KatanaLiquidatorForkTest is Test {
         oracle.setPrice(1.8e36);
         (, uint128 borrowShares,) = morpho.position(id, borrower);
         bytes memory swapData = abi.encodeWithSelector(MockSwapper.swapAll.selector);
-        vm.expectRevert();                     // ProfitTooLow
-        liq.liquidate(mp, borrower, uint256(borrowShares), address(swapper), swapData, 1_000_000e18);
+        vm.expectPartialRevert(KatanaLiquidator.ProfitTooLow.selector);  // THIS revert, any args
+        liq.liquidate(mp, borrower, 0, uint256(borrowShares), address(swapper), swapData, 1_000_000e18);
     }
 
     function testOnlyOwnerAndOnlyMorpho() public {
@@ -162,11 +205,17 @@ contract KatanaLiquidatorForkTest is Test {
         bytes memory swapData = "";
         vm.prank(address(0xBAD));
         vm.expectRevert(KatanaLiquidator.NotOwner.selector);
-        liq.liquidate(mp, borrower, 1, address(swapper), swapData, 0);
+        liq.liquidate(mp, borrower, 0, 1, address(swapper), swapData, 0);
 
         vm.prank(address(0xBAD));
         vm.expectRevert(KatanaLiquidator.NotMorpho.selector);
         liq.onMorphoLiquidate(1, "");
+    }
+
+    function testSetOwnerZeroAddressReverts() public {
+        if (!forked) return;
+        vm.expectRevert(KatanaLiquidator.ZeroAddress.selector);
+        liq.setOwner(address(0));
     }
 }
 

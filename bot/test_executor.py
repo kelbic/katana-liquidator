@@ -21,7 +21,9 @@ def _target(seized_btc=1.0, repaid_usdc=61000.0):
             "irm": "0x4F708C0ae7deD3d74736594C2109C2E3c065B428", "lltv": 860000000000000000,
             "hf": 0.98, "debt_assets": int(repaid_usdc * 1e6),
             "repaid_assets": int(repaid_usdc * 1e6), "seized_assets": int(seized_btc * 1e8),
-            "borrow_shares_repaid": int(repaid_usdc * 1e6 * 1000)}
+            "borrow_shares_repaid": int(repaid_usdc * 1e6 * 1000),
+            # oracle scale: loan wei per coll wei * 1e36 (vbUSDC 6dec / vbWBTC 8dec)
+            "price": int(repaid_usdc * 1e6 / 1e8 * 1e36)}
 
 
 def _stub_quote(out_per_btc, impact):
@@ -129,12 +131,34 @@ class TestEvaluate(unittest.TestCase):
 class TestCalldata(unittest.TestCase):
     def test_selector_and_wellformed(self):
         t = _target()
-        ev = {"repaid_shares": 232059231929812358,
+        ev = {"repaid_shares": 232059231929812358, "seized_arg": 0,
               "swap_target": "0xAC4c6e212A361c968F1725b4d055b47E63F80b75",
               "swap_calldata": "0xdeadbeef", "min_profit_wei": 20000000}
         cd = ex.liquidate_calldata(t, ev)
-        self.assertTrue(cd.startswith("0x4bffc045"))     # verified vs cast
+        self.assertTrue(cd.startswith("0x79755efe"))     # verified vs cast sig
         self.assertEqual((len(cd) - 2) % 64, 8)          # selector(4B) + 32B words
+
+    def test_capped_close_fires_seized_assets_mode(self):
+        # M2: collateral-capped target (repaid < debt) must fire with seizedAssets pinned
+        # (0.3% under the cap) and repaidShares == 0 — Morpho derives repaid at exec price
+        ex.quote = _stub_quote(out_per_btc=61500, impact=0.008)
+        t = _target(1.0, 61000.0)
+        t["debt_assets"] = int(80000.0 * 1e6)            # debt > repaid -> capped
+        ev = ex.evaluate(None, t, gas_usd=0.01)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["repaid_shares"], 0)
+        self.assertEqual(ev["seized_arg"],
+                         t["seized_assets"] * ex._HAIRCUT_NUM // ex._HAIRCUT_DEN)
+        cd = ex.liquidate_calldata(t, {**ev, "min_profit_wei": 1})
+        self.assertTrue(cd.startswith("0x79755efe"))
+
+    def test_uncapped_close_fires_shares_mode(self):
+        ex.quote = _stub_quote(out_per_btc=61500, impact=0.008)
+        t = _target(1.0, 61000.0)                        # repaid == debt -> not capped
+        ev = ex.evaluate(None, t, gas_usd=0.01)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["seized_arg"], 0)
+        self.assertGreater(ev["repaid_shares"], 0)
 
 
 class TestGuards(unittest.TestCase):
