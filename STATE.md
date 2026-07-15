@@ -6,6 +6,16 @@ verdict + architecture + economics + decision log. Operator handoff steps are in
 Status as of **2026-07-13**: verification done, code built, **fork-tested end-to-end**, deploy-
 ready. Stopped BEFORE live mainnet deploy (operator's key + funding = operator's step).
 
+**Update 2026-07-15 — LIVE + hot-poll.** Deployed live (DRY_RUN=0). Diagnosed why it had 0 fires:
+NOT sizing/markets (measured — all ~$4.2M/500-liq flow is in the 6 registered markets; the
+persistent "no profitable chunk" declines are correct bad-debt dregs, coll≪debt). It was the flat
+20s poll on a ~1s-block chain — fresh liquidations were taken by fast bots seconds before our next
+look, so we only ever saw the dregs. We're ~8ms from the Katana RPC (EU), so latency is NOT the
+constraint. Fix (commit b1d8108): hot-poll the imminent subset (HF<HOT_WATCH_HF) on-chain every
+~1s (hot pass ~1.3s) with a full Morpho-indexer refresh every ~30s; decline-dedup so bad-debt
+dregs don't re-hammer Sushi; multicall chunk 100→250. Firing logic unchanged. Effective look-
+cadence ~20s → ~2s. Truly winning 1-block races would need event-driven detection (future v2).
+
 ---
 
 ## ⭐ TASK 1 — VERIFICATION VERDICT: **+EV is REAL** (and bigger than the initial estimate)
