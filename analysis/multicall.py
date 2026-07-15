@@ -59,7 +59,7 @@ def decode_aggregate3(result_hex: str) -> list[tuple[bool, str]]:
     return out
 
 
-def multicall(rpc, calls: list[tuple[str, str]], chunk: int = 100,
+def multicall(rpc, calls: list[tuple[str, str]], chunk: int = 250,
               gas: int = 30_000_000) -> list[tuple[bool, str]]:
     """Batched aggregate3 over an Rpc (eth_call only). Probed 2026-07-04: rpc1 accepts
     explicit gas up to >=100M; a minority backend behind the LB intermittently rejects

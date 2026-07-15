@@ -53,6 +53,10 @@ LIQ_LOG_WINDOW = int(os.environ.get("KT_LIQ_LOG_WINDOW", "0"))
 
 WATCH_HF = 1.05         # positions below this form the watch set
 REPORT_HF = 1.15        # risk table cutoff
+# Hot-poll subset: positions within this HF of liquidation are re-swept on-chain on every hot pass
+# (skip_api), so the hot loop re-reads only the imminent handful (~tens) instead of the whole book
+# (~hundreds) — keeps a hot pass sub-second so we actually catch a cross within the hot cadence.
+HOT_WATCH_HF = float(os.environ.get("KT_HOT_WATCH_HF", "1.05"))
 MIN_DEBT_USD = float(os.environ.get("KT_MIN_DEBT_USD", "500"))
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -147,13 +151,24 @@ def _bucket(hf: float) -> str:
 
 # --- core scan (shared by CLI + executor) --------------------------------------
 def discover(rpc: Rpc, state: dict, to: int, hf_ceiling: float = API_HF_CEILING,
-             market_ids: set[str] | None = None) -> tuple[dict, list]:
+             market_ids: set[str] | None = None, skip_api: bool = False) -> tuple[dict, list]:
     """Build the candidate book {market_id: set(borrowers)}. Default mode "api": current
     near-edge borrowers from the Morpho indexer (instant, no historical scan). Mode "logs":
     incremental Borrow logs over a BOUNDED recent window only (never from block 0). Also returns
     real Liquidate events over an optional bounded window (CLI fidelity log; empty by default).
-    On API failure, falls back to a bounded incremental-logs window so the pass still runs."""
+    On API failure, falls back to a bounded incremental-logs window so the pass still runs.
+
+    skip_api=True (hot-poll): reuse the borrower book persisted from the last full discovery and do
+    NO network discovery at all — the caller re-reads each position's HF on-chain via the multicall
+    sweep in scan(). This lets the loop hot-poll HF every ~2s (cheap, on-chain) while refreshing the
+    Morpho-indexer set only every ~30s (avoids hammering the public API), so we actually catch a
+    position the instant it crosses HF<1 instead of ~20s late."""
     liquidations: list = []
+    if skip_api:
+        # hot-poll: re-sweep only the imminent subset (HF < HOT_WATCH_HF) cached by the last full
+        # pass, so a hot pass stays sub-second. Fall back to the full book if no hot set yet.
+        hot = state.get("hot_pairs") or state.get("pairs", {})
+        return {m: set(bs) for m, bs in hot.items()}, liquidations
 
     if DISCOVERY == "api":
         # fresh near-edge set each pass — the indexer already tracks the current book, so we do
@@ -195,7 +210,8 @@ def _merge_incremental_logs(rpc: Rpc, pairs: dict, state: dict, to: int, window:
 
 def scan(rpc: Rpc | None = None, state: dict | None = None,
          min_debt_usd: float = MIN_DEBT_USD, report_hf: float = REPORT_HF,
-         hf_ceiling: float = API_HF_CEILING, market_ids: set[str] | None = None) -> dict:
+         hf_ceiling: float = API_HF_CEILING, market_ids: set[str] | None = None,
+         skip_api: bool = False) -> dict:
     """One pass. Returns:
         {block, targets:[...HF<1...], risk:[...HF<report_hf...], liquidations:[...],
          state} — the executor uses `targets`; the CLI logs `risk` + `liquidations`.
@@ -206,7 +222,8 @@ def scan(rpc: Rpc | None = None, state: dict | None = None,
     to = rpc.block_number()
 
     # 1. discovery (Morpho indexer by default; bounded logs otherwise) + optional real liqs
-    pairs, liquidations = discover(rpc, state, to, hf_ceiling=hf_ceiling, market_ids=market_ids)
+    pairs, liquidations = discover(rpc, state, to, hf_ceiling=hf_ceiling, market_ids=market_ids,
+                                   skip_api=skip_api)
 
     # 2. multicall sweep: params (new mids) -> market state -> positions -> prices
     params = dict(state["params"])
@@ -258,11 +275,19 @@ def scan(rpc: Rpc | None = None, state: dict | None = None,
         else:
             risk.append(row)
 
-    # Persist the params cache always (immutable, saves re-fetching idToMarketParams). Persist
-    # the pairs book only in logs mode (API mode rediscovers fresh each pass).
+    # Persist the params cache always (immutable, saves re-fetching idToMarketParams). Persist the
+    # full pairs book so hot-poll passes can re-read HF between ~30s Morpho-indexer refreshes; and
+    # persist the hot subset (imminent, HF<HOT_WATCH_HF) that a hot pass re-sweeps on-chain, so a hot
+    # pass touches only the imminent handful and stays sub-second. On skip_api passes we only swept
+    # the hot subset, so keep the last full book rather than shrinking it to the hot set.
+    hot_pairs: dict = {}
+    for row in targets + risk:
+        if row["hf"] < HOT_WATCH_HF:
+            hot_pairs.setdefault(row["market_id"], set()).add(row["borrower"])
     new_state = {"last_block": to, "params": params,
                  "pairs": ({m: sorted(bs) for m, bs in pairs.items() if bs}
-                           if DISCOVERY != "api" else state.get("pairs", {}))}
+                           if not skip_api else state.get("pairs", {})),
+                 "hot_pairs": {m: sorted(bs) for m, bs in hot_pairs.items()}}
     return {"block": to, "from_block": state.get("last_block", -1) + 1, "targets": targets,
             "risk": risk, "liquidations": liquidations, "state": new_state,
             "n_positions": len(raw_pos)}

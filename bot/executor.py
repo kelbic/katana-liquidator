@@ -70,7 +70,14 @@ MIN_PROFIT_USD = float(os.environ.get("KT_MIN_PROFIT_USD", "20"))
 MIN_DEBT_USD = float(os.environ.get("KT_MIN_DEBT_USD", "500"))
 MAX_SLIPPAGE = float(os.environ.get("KT_MAX_SLIPPAGE", "0.008"))   # swap floor sent to Sushi
 MAX_IMPACT = float(os.environ.get("KT_MAX_IMPACT", "0.02"))        # chunk if impact above this
-POLL_SEC = int(os.environ.get("KT_POLL_SEC", "20"))
+POLL_SEC = int(os.environ.get("KT_POLL_SEC", "20"))         # cadence when NOTHING is near-edge
+# Hot-poll: when near-edge positions exist, re-read their HF on-chain this often (cheap; ~8ms RTT
+# to the Katana RPC from our region) so we catch a cross within ~HOT_POLL_SEC instead of ~POLL_SEC.
+# The Morpho-indexer set is refreshed only every API_REFRESH_SEC to avoid hammering the public API.
+HOT_POLL_SEC = float(os.environ.get("KT_HOT_POLL_SEC", "1"))
+API_REFRESH_SEC = float(os.environ.get("KT_API_REFRESH_SEC", "30"))
+HOT_HF = float(os.environ.get("KT_HOT_HF", "1.02"))         # hot-poll only when a position is within
+#                                                             this HF of liquidation (imminent cross)
 GAS_LIMIT = int(os.environ.get("KT_GAS_LIMIT", "1800000"))        # generous (liq+swap+repay+sweep)
 GAS_UNITS_EST = int(os.environ.get("KT_GAS_UNITS", "900000"))     # for gas-cost estimate
 CHAIN_ID = int(os.environ.get("KT_CHAIN_ID", "747474"))
@@ -78,6 +85,12 @@ PRIORITY_GWEI = float(os.environ.get("KT_PRIORITY_GWEI", "0.001"))
 MAX_DAILY_GAS_USD = float(os.environ.get("KT_MAX_DAILY_GAS_USD", "5"))
 MAX_CONSEC_REVERTS = int(os.environ.get("KT_MAX_CONSEC_REVERTS", "3"))
 DEDUP_SEC = int(os.environ.get("KT_DEDUP_SEC", "300"))
+# Don't re-evaluate a target that was just declined ("no profitable chunk") — the perpetual
+# bad-debt dregs (HF≈0.6-0.9, no profitable exit) sit near-edge forever, and at hot-poll cadence
+# re-quoting them every pass would hammer the Sushi API (evaluate tries up to 8 chunk quotes each).
+# A short TTL re-checks them occasionally without spamming; a freshly-crossed target is never in
+# this cache so it's still evaluated instantly.
+DECLINE_TTL = float(os.environ.get("KT_DECLINE_TTL", "60"))
 HEARTBEAT_SEC = int(os.environ.get("KT_HEARTBEAT_SEC", "86400"))
 RAW_TX = os.environ.get("KT_RAW_TX", "0") == "1"
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
@@ -102,7 +115,7 @@ def load_state() -> dict:
             return json.load(open(STATE_FILE))
         except Exception:
             pass
-    return {"day": "", "gas_usd": 0.0, "consec_reverts": 0, "sent": {},
+    return {"day": "", "gas_usd": 0.0, "consec_reverts": 0, "sent": {}, "declined": {},
             "last_heartbeat": 0, "passes": 0, "fires": 0, "reverts": 0}
 
 
@@ -363,6 +376,13 @@ def recently_fired(st: dict, key: str, now_ts: float) -> bool:
     return bool(rec and (now_ts - rec["ts"]) < DEDUP_SEC and rec.get("status") != "revert")
 
 
+def recently_declined(st: dict, key: str, now_ts: float) -> bool:
+    """True if this target was declined ('no profitable chunk') within DECLINE_TTL — skip re-quoting
+    it (avoids hammering Sushi with the perpetual bad-debt dregs at hot-poll cadence)."""
+    rec = st.get("declined", {}).get(key)
+    return bool(rec and (now_ts - rec["ts"]) < DECLINE_TTL)
+
+
 # --- pass / loop ---------------------------------------------------------------
 def _seed_monitor_state() -> dict:
     ms = load_monitor_state()
@@ -374,7 +394,9 @@ def _seed_monitor_state() -> dict:
     return ms
 
 
-def once(st: dict | None = None, mstate: dict | None = None) -> int:
+def once(st: dict | None = None, mstate: dict | None = None, skip_api: bool = False) -> tuple[int, int]:
+    """One pass. Returns (n_targets HF<1, n_near_edge HF<report_hf). skip_api=True re-reads the
+    cached borrower set's HF on-chain without a Morpho-indexer call (hot-poll)."""
     own = st is None
     if own:
         st = load_state()
@@ -384,14 +406,15 @@ def once(st: dict | None = None, mstate: dict | None = None) -> int:
     if mstate is None:
         mstate = _seed_monitor_state()
 
-    r = scan(rpc, mstate, min_debt_usd=MIN_DEBT_USD)
+    r = scan(rpc, mstate, min_debt_usd=MIN_DEBT_USD, skip_api=skip_api)
     mstate.clear()
     mstate.update(r["state"])
     st["passes"] += 1
 
     ok, reason = guard_ok(st)
     print(f"[{time.strftime('%H:%M:%S')}] block {r['block']} | positions {r['n_positions']} | "
-          f"targets(HF<1) {len(r['targets'])} | guard={'OK' if ok else 'STOP('+reason+')'} "
+          f"near-edge {len(r['risk'])} | targets(HF<1) {len(r['targets'])} | "
+          f"{'hot' if skip_api else 'API'} | guard={'OK' if ok else 'STOP('+reason+')'} "
           f"(DRY_RUN={'on' if DRY_RUN else 'OFF'}, contract={'set' if CONTRACT else 'none'})")
     if not ok:
         if own:
@@ -399,22 +422,30 @@ def once(st: dict | None = None, mstate: dict | None = None) -> int:
         raise GuardTripped(reason)
 
     gas_usd = gas_cost_usd(rpc)
+    st.setdefault("declined", {})
     for t in sorted(r["targets"], key=lambda x: -(x["debt_usd"] or 0)):
-        t["borrow_shares_repaid"] = _shares_for_repaid(rpc, t)
         key = f"{t['market_id']}:{t['borrower']}"
-        if recently_fired(st, key, now_ts):
+        # dedup BEFORE the per-target RPC (_shares_for_repaid) and Sushi quotes, so a skipped
+        # target costs nothing — critical at hot-poll cadence with perpetual bad-debt dregs
+        if recently_fired(st, key, now_ts) or recently_declined(st, key, now_ts):
             continue
+        t["borrow_shares_repaid"] = _shares_for_repaid(rpc, t)
         ev = evaluate(rpc, t, gas_usd)
         if not ev:
+            st["declined"][key] = {"ts": now_ts}
             print(f"  skip {t['borrower'][:10]}… HF={t['hf']:.4f}: no profitable chunk")
             continue
         nets = f"${ev['net_usd']:+,.1f}" if ev["net_usd"] is not None else f"{ev['net_wei']}wei"
         print(f"  target {t['borrower'][:10]}… HF={t['hf']:.4f} chunk={ev['f']:.0%} "
               f"net={nets} impact={ev['impact']*100:.2f}%")
         fire(t, ev, st, now_ts, gas_usd)
+    # prune expired decline-cache entries so it can't grow unbounded
+    st["declined"] = {k: v for k, v in st["declined"].items() if now_ts - v["ts"] < DECLINE_TTL}
     if own:
         save_state(st)
-    return len(r["targets"])
+    # imminent = any position (target or near-edge) within HOT_HF of the liquidation line -> hot-poll
+    n_hot = sum(1 for x in r["targets"] + r["risk"] if x["hf"] < HOT_HF)
+    return len(r["targets"]), n_hot
 
 
 _SEL_POSITION = selector("position(bytes32,address)")
@@ -449,11 +480,19 @@ def loop() -> None:
     mstate = _seed_monitor_state()
     alert(f"▶️ katana executor started (DRY_RUN={'on' if DRY_RUN else 'OFF'}, "
           f"min_profit ${MIN_PROFIT_USD}, contract={'set' if CONTRACT else 'NONE'}, "
+          f"hot-poll {HOT_POLL_SEC}s<HF{HOT_HF}/API {API_REFRESH_SEC}s/idle {POLL_SEC}s, "
           f"kill-switch: gas ${MAX_DAILY_GAS_USD}/day, {MAX_CONSEC_REVERTS} reverts).")
     st["last_heartbeat"] = time.time()
+    last_api = 0.0
     while True:
+        n_hot = 0
         try:
-            once(st, mstate)
+            # refresh the Morpho-indexer borrower set every API_REFRESH_SEC; between refreshes,
+            # re-read the cached set's HF on-chain (skip_api) so we can hot-poll cheaply.
+            do_api = (time.time() - last_api) >= API_REFRESH_SEC
+            _, n_hot = once(st, mstate, skip_api=not do_api)
+            if do_api:
+                last_api = time.time()
         except GuardTripped as g:
             alert(f"🛑 KILL-SWITCH: {g}. Executor stopped — needs intervention "
                   f"(python3 -m bot.executor reset, then restart).")
@@ -463,7 +502,8 @@ def loop() -> None:
             print(f"loop err: {e}")
         heartbeat(st)
         save_state(st)
-        time.sleep(POLL_SEC)
+        # hot cadence when a position is within HOT_HF of liquidation, else idle cadence
+        time.sleep(HOT_POLL_SEC if n_hot > 0 else POLL_SEC)
 
 
 def main() -> None:
