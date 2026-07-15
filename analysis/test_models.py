@@ -1,8 +1,9 @@
 """Unit tests for pure Gate-1 math — run: python3 -m analysis.test_models"""
 import unittest
 
-from analysis.models import (WAD, lif_from_lltv, morpho_bonus_usd, gross_margin_usd,
-                             gas_cost_usd, top_share, hhi, month_key, day_ts, per_month_usd)
+from analysis.models import (WAD, accrued_interest, lif_from_lltv, morpho_bonus_usd,
+                             gross_margin_usd, gas_cost_usd, top_share, hhi, month_key,
+                             day_ts, per_month_usd, w_taylor_compounded)
 
 
 class TestLif(unittest.TestCase):
@@ -56,6 +57,39 @@ class TestTime(unittest.TestCase):
                {"ts": 1780000000, "usd": 1.0}, {"ts": 1780000000, "usd": None}]
         self.assertEqual(per_month_usd(evs, "usd"),
                          {"2026-07": 15.0, "2026-05": 1.0})
+
+
+class TestAccrual(unittest.TestCase):
+    """Morpho MathLib.wTaylorCompounded / _accrueInterest port (review C3). The rate is
+    PER-SECOND WAD — a x1000 dimensional slip would show up instantly in these vectors."""
+
+    def test_taylor_matches_exp_minus_one(self):
+        import math
+        rate = int(0.05 * WAD) // 31_536_000        # 5% APR as a per-second WAD rate
+        for elapsed in (1, 3600, 86400, 30 * 86400):
+            got = w_taylor_compounded(rate, elapsed) / WAD
+            exact = math.exp(rate / WAD * elapsed) - 1.0
+            self.assertAlmostEqual(got, exact, delta=exact * 1e-4 + 1e-12)
+
+    def test_taylor_exact_terms(self):
+        # hand-computed: rate*n = 0.1 WAD -> 0.1 + 0.005 + 0.000166.. (floor each term)
+        rate, n = WAD // 100, 10                    # rate*n = 0.1 WAD
+        first = rate * n
+        second = first * first // (2 * WAD)
+        third = second * first // (3 * WAD)
+        self.assertEqual(w_taylor_compounded(rate, n), first + second + third)
+
+    def test_accrued_interest_magnitude(self):
+        # $1M-scale totals at 5% APR for 1 day ≈ 0.0137% — the exact stale-HF gap C3 is about
+        rate = int(0.05 * WAD) // 31_536_000
+        total = 10 ** 24
+        got = accrued_interest(total, rate, 86400)
+        self.assertAlmostEqual(got / total, 0.05 / 365, delta=0.05 / 365 * 0.01)
+
+    def test_accrued_interest_zero_cases(self):
+        self.assertEqual(accrued_interest(10 ** 24, 0, 86400), 0)
+        self.assertEqual(accrued_interest(10 ** 24, 10 ** 9, 0), 0)
+        self.assertEqual(accrued_interest(10 ** 24, 10 ** 9, -5), 0)
 
 
 if __name__ == "__main__":

@@ -24,9 +24,10 @@ import os
 import time
 
 from analysis.keccak import selector
-from analysis.models import lif_from_lltv, morpho_health_factor, shares_to_assets_up
+from analysis.models import (accrued_interest, lif_from_lltv, morpho_health_factor,
+                             shares_to_assets_up)
 from analysis.morpho_api import fetch_candidates
-from analysis.multicall import multicall
+from analysis.multicall import MULTICALL3, multicall
 from analysis.protocols import (MORPHO, STABLES, TOKENS, TOPIC_MORPHO_BORROW,
                                 TOPIC_MORPHO_LIQUIDATE, decode_morpho_borrow,
                                 decode_morpho_liquidate)
@@ -36,6 +37,13 @@ SEL_POSITION = selector("position(bytes32,address)")
 SEL_MARKET = selector("market(bytes32)")
 SEL_ID_TO_MARKET_PARAMS = selector("idToMarketParams(bytes32)")
 SEL_PRICE = selector("price()")
+# IRM per-second borrow rate (WAD) for the accrual adjustment: liquidate() accrues interest
+# BEFORE _isHealthy, so HF must be computed on debt + unaccrued interest, not stored totals —
+# especially on quiet markets where lastUpdate can be days old (review C3).
+SEL_BORROW_RATE_VIEW = selector(
+    "borrowRateView((address,address,address,address,uint256),"
+    "(uint128,uint128,uint128,uint128,uint128,uint128))")
+SEL_MC3_TIMESTAMP = selector("getCurrentBlockTimestamp()")
 
 # --- discovery -----------------------------------------------------------------
 # Position book = CURRENT borrowers from the Morpho indexer (analysis.morpho_api), NOT a
@@ -114,11 +122,35 @@ def size_liquidation(debt_assets: int, collateral: int, price: int, lltv: int) -
     return {"lif": lif, "repaid_assets": repaid, "seized_assets": seized}
 
 
+def encode_borrow_rate_view(p: dict, mkt: dict) -> str:
+    """Calldata for irm.borrowRateView(marketParams, market) — two static structs, 11 words."""
+    words = [int(p["loan"], 16), int(p["collateral"], 16), int(p["oracle"], 16),
+             int(p["irm"], 16), p["lltv"],
+             mkt["total_supply_assets"], mkt["total_supply_shares"],
+             mkt["total_borrow_assets"], mkt["total_borrow_shares"],
+             mkt["last_update"], mkt["fee"]]
+    return SEL_BORROW_RATE_VIEW + "".join(f"{w:064x}" for w in words)
+
+
+# Coarse env prices for non-stable loan sizing (MIN_DEBT gate + target ordering ONLY — the
+# profit gates in bot/executor.py use live Sushi quotes, never these).
+ETH_USD_APPROX = float(os.environ.get("KT_ETH_USD", "3300"))
+BTC_USD_APPROX = float(os.environ.get("KT_BTC_USD", "100000"))
+_APPROX_USD = {TOKENS["vbETH"]["address"].lower(): ETH_USD_APPROX,
+               TOKENS["weETH"]["address"].lower(): ETH_USD_APPROX,
+               TOKENS["vbWBTC"]["address"].lower(): BTC_USD_APPROX,
+               TOKENS["LBTC"]["address"].lower(): BTC_USD_APPROX}
+
+
 def debt_usd(loan_addr: str, debt_assets: int) -> float | None:
-    """USD size of debt. Stables (vbUSDC/vbUSDT) ~ $1 -> reliable; else None (sized in units)."""
+    """USD size of debt. Stables (vbUSDC/vbUSDT) ~ $1 -> reliable; ETH/BTC-denominated loans
+    use the coarse env price above (so vbETH-loan positions face the MIN_DEBT gate and sort by
+    real size instead of bypassing both, review H1); unknown tokens -> None (still watched)."""
     la = loan_addr.lower()
     if la in STABLES:
         return debt_assets / 10 ** _DEC.get(la, 6)
+    if la in _APPROX_USD:
+        return debt_assets / 10 ** _DEC.get(la, 18) * _APPROX_USD[la]
     return None
 
 
@@ -238,21 +270,46 @@ def scan(rpc: Rpc | None = None, state: dict | None = None,
     mstate = {m: decode_market_state(ret) for m, (ok, ret) in zip(mids, res)
               if ok and len(ret) >= 2 + 6 * 64}
 
+    # positions + oracle prices + IRM rates + block timestamp in ONE aggregate3 round: fewer
+    # round-trips AND internally consistent (single block) — position/price/rate can't come
+    # from different replica heights (review M6/C3).
     flat = [(m, b) for m in mids for b in sorted(pairs[m])]
-    res = multicall(rpc, [(MORPHO, SEL_POSITION + m[2:] + b[2:].rjust(64, "0"))
-                          for m, b in flat])
+    live_mids = [m for m in mids if m in mstate]
+    rate_mids = [m for m in live_mids if int(params[m]["irm"], 16) != 0]
+    calls = ([(MORPHO, SEL_POSITION + m[2:] + b[2:].rjust(64, "0")) for m, b in flat]
+             + [(params[m]["oracle"], SEL_PRICE) for m in live_mids]
+             + [(params[m]["irm"], encode_borrow_rate_view(params[m], mstate[m]))
+                for m in rate_mids]
+             + [(MULTICALL3, SEL_MC3_TIMESTAMP)])
+    res = multicall(rpc, calls)
+    pos_res = res[:len(flat)]
+    price_res = res[len(flat):len(flat) + len(live_mids)]
+    rate_res = res[len(flat) + len(live_mids):len(flat) + len(live_mids) + len(rate_mids)]
+    ts_ok, ts_ret = res[-1]
+    chain_now = _words(ts_ret)[0] if ts_ok and len(ts_ret) >= 66 else int(time.time())
+
     raw_pos = {}
-    for (m, b), (ok, ret) in zip(flat, res):
+    for (m, b), (ok, ret) in zip(flat, pos_res):
         if ok and len(ret) >= 2 + 3 * 64:
             raw_pos[(m, b)] = decode_position(ret)
     for (m, b), p in list(raw_pos.items()):
         if p["borrow_shares"] == 0 and p["collateral"] == 0 and p["supply_shares"] == 0:
             pairs[m].discard(b)
 
-    active = sorted({m for (m, b), p in raw_pos.items() if p["borrow_shares"] > 0})
-    res = multicall(rpc, [(params[m]["oracle"], SEL_PRICE) for m in active])
-    prices = {m: _words(ret)[0] for m, (ok, ret) in zip(active, res)
+    prices = {m: _words(ret)[0] for m, (ok, ret) in zip(live_mids, price_res)
               if ok and len(ret) >= 66}
+
+    # accrue pending interest into the stored totals (what liquidate() itself does before
+    # _isHealthy) — otherwise HF is systematically stale-high on quiet markets (review C3)
+    for m, (ok, ret) in zip(rate_mids, rate_res):
+        if not ok or len(ret) < 66:
+            continue
+        mkt = mstate[m]
+        interest = accrued_interest(mkt["total_borrow_assets"], _words(ret)[0],
+                                    chain_now - mkt["last_update"])
+        if interest:
+            mkt["total_borrow_assets"] += interest
+            mkt["total_supply_assets"] += interest
 
     # 3. assess + build target/risk rows
     targets, risk = [], []

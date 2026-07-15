@@ -174,3 +174,37 @@ Hot wallet holds only gas; profit is swept out; contract holds no standing funds
   expected). The bot will fire the moment a real vbWBTC/vbETH position crosses HF<1.
 - **Open follow-ups** (post-deploy, operator's call): reactive near-edge poll for the weETH/vbETH
   cluster (sized small); periodic `sweep(collateralToken)` for dust; watch Sushi CoL depth trend.
+
+**Update 2026-07-15 (2) — внешнее ревью применено (worktree-review-fixes).** Полное ревью кода
+(6 измерений + сверка с Morpho.sol) нашло 4 критических + 10 высоких. Применено в этом коммите:
+- **C1** float-переполнение repaidShares >2^53: chunk-фракции теперь рационалы, всё сайзинг —
+  точная целочисленная математика (иначе полный клоуз $3.4M weETH/vbETH детерминированно
+  Panic(0x11) → 3 реверта → kill-switch). Тест с шарами 1e27.
+- **C2** startup-preflight: eth_abi/eth_account/cast/код контракта/chainId проверяются на старте
+  loop, фейл = громкий alert + exit(1) (раньше ModuleNotFoundError глотался как «loop err» —
+  eth_account реально не был установлен на VPS при DRY_RUN=0!).
+- **C3** accrual: HF считается с довесом процентов (irm.borrowRateView + wTaylorCompounded, порт
+  MathLib) — на тихих рынках stored-HF опаздывал на дни процентов (дреги: 0.70→0.51). Плюс
+  preflight eth_call точной calldata перед отправкой (ловит lost race + гоняет реальный
+  _accrueInterest+_isHealthy за ~10мс бесплатно).
+- **C4** kill-switch: sys.exit(1), алерты троттлятся (cron воскрешает каждую минуту), TG-токен
+  из KT_TG_TOKEN/файла с кэшем, KT_CHAT_ID теперь обязательный env (дефолт пуст + warning).
+- **H1** профит-флор для не-стейбл займов (vbETH): USD-флор через живой ETH_USD (Sushi-квота,
+  5мин TTL; захардкоженные $3300 были в 1.7 раза выше рынка), on-chain minProfit =
+  max(usd_floor, net/2) везде. Approx-USD долга для ETH/BTC-займов → MIN_DEBT-гейт работает.
+- **H2** Telegram-алерты асинхронные и ПОСЛЕ broadcast (блокирующий sendMessage стоял между
+  решением и отправкой, до 20с). **H3** RAW_TX=1 дефолт (in-process подпись; cast — фолбэк,
+  ключ через env, не argv). **H5** классификация ревертов: «position is healthy»/Panic(0x11) =
+  lost_race, НЕ инкрементит kill-switch. **H6** dedup: успех блокирует 10с (остаток чанкованной
+  ликвидации перезабирается сразу), pending — до DEDUP_SEC. **H7** ресипт ждём 20с → pending
+  трекается и класифицируется следующими пассами; send-фейл ≠ revert. **H8** quote timeout 5s /
+  2 ретрая / дедлайн evaluate 10с; 429/408 Sushi ретраятся (были NoRoute→скип таргета).
+  **H9** keep-alive на write-пути. **H10** hot-тик: Rpc retries=2, ротация стартового
+  эндпоинта по номеру пасса. **M2** capped-close: −0.5% к шарам. **M3** перечитка оракула перед
+  файром (>0.2% вниз = скип тика). **M6** позиции+цены+ставки+timestamp в одном aggregate3.
+  **M7** ручной `once` принудительно DRY_RUN=1 (KT_FORCE_LIVE_ONCE=1 для обхода). **M8**
+  KT_LIQ_LOG_WINDOW=2000: чужие Liquidate → «RACE» алерт + races_lost в heartbeat. Газ
+  списывается по фактическому gasUsed из ресипта.
+Отложено (требует редеплой контракта): M4 авто-sweep collateral-пыли (0.3% сеиза оседает в
+контракте), M2-полный (режим seizedAssets), событие с marketId. Отложено (инфра): WSS/платный
+RPC, параллельный сабмит на несколько ингрессов, нонс-реплейсмент застрявших транз.

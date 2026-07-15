@@ -76,12 +76,32 @@ def shares_to_assets_up(shares: int, total_assets: int, total_shares: int) -> in
     return (num + den - 1) // den
 
 
+def w_taylor_compounded(rate_wad: int, elapsed: int) -> int:
+    """Morpho MathLib.wTaylorCompounded — 3-term Taylor of e^(rate*elapsed) - 1, WAD-scaled,
+    rounding down each term exactly like the contract. `rate_wad` is the PER-SECOND borrow
+    rate (WAD) returned by irm.borrowRateView."""
+    first = rate_wad * elapsed
+    second = first * first // (2 * WAD)
+    third = second * first // (3 * WAD)
+    return first + second + third
+
+
+def accrued_interest(total_borrow_assets: int, borrow_rate_wad: int, elapsed: int) -> int:
+    """Interest (loan assets) Morpho._accrueInterest would add to totalBorrowAssets after
+    `elapsed` seconds since lastUpdate: totalBorrow.wMulDown(rate.wTaylorCompounded(elapsed)).
+    liquidate() accrues BEFORE _isHealthy, so the real on-chain HF is computed against
+    debt + this interest — stored-state HF alone is a stale upper bound."""
+    if elapsed <= 0 or borrow_rate_wad <= 0:
+        return 0
+    return total_borrow_assets * w_taylor_compounded(borrow_rate_wad, elapsed) // WAD
+
+
 def morpho_health_factor(collateral: int, oracle_price: int, lltv_wad: int,
                          borrowed_assets: int) -> float:
     """HF = maxBorrow / borrowed, maxBorrow = collateral * price / 1e36 * lltv / 1e18
     (Morpho.sol _isHealthy). float — paper precision; inf when no debt.
-    NOTE: uses last-stored market state — interest since lastUpdate is not accrued,
-    so HF is overstated by the unaccrued interest (small near the threshold)."""
+    NOTE: pass accrual-adjusted debt (see accrued_interest) — liquidate() accrues interest
+    before _isHealthy, so stored-state HF alone is an overstated upper bound."""
     if borrowed_assets <= 0:
         return float("inf")
     max_borrow = collateral * oracle_price // ORACLE_PRICE_SCALE * lltv_wad // WAD

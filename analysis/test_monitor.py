@@ -85,8 +85,14 @@ class TestDebtUsd(unittest.TestCase):
         usdc = TOKENS["vbUSDC"]["address"]
         self.assertAlmostEqual(debt_usd(usdc, 1_500_000000), 1500.0, places=6)  # 6 dec
 
-    def test_nonstable_debt_is_none(self):
-        self.assertIsNone(debt_usd(TOKENS["vbETH"]["address"], 10 ** 18))
+    def test_nonstable_debt_is_approx_priced(self):
+        # ETH/BTC-denominated loans get a coarse env price so the MIN_DEBT gate applies (H1)
+        from analysis.monitor import ETH_USD_APPROX
+        self.assertAlmostEqual(debt_usd(TOKENS["vbETH"]["address"], 10 ** 18),
+                               ETH_USD_APPROX, places=6)
+
+    def test_unknown_debt_is_none(self):
+        self.assertIsNone(debt_usd("0x" + "77" * 20, 10 ** 18))
 
 
 if __name__ == "__main__":

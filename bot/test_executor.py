@@ -88,7 +88,42 @@ class TestEvaluate(unittest.TestCase):
         ex.quote = _stub_quote(out_per_btc=61500, impact=0.008)
         t = _target(1.0, 61000.0)
         ev = ex.evaluate(None, t, gas_usd=0.01)
-        self.assertEqual(ev["min_profit_wei"], int(ex.MIN_PROFIT_USD * 1e6))  # vbUSDC 6dec
+        # on-chain floor = USD floor AND at least half the quoted net (H1/M1)
+        self.assertEqual(ev["min_profit_wei"],
+                         max(int(ex.MIN_PROFIT_USD * 1e6), ev["net_wei"] // 2))
+        self.assertGreaterEqual(ev["min_profit_wei"], int(ex.MIN_PROFIT_USD * 1e6))
+
+    def test_exact_shares_above_float53(self):
+        # C1: an 18-dec loan's borrowShares run ~1e27 — far past float64's 2^53 exact range.
+        # int(shares * 1.0) rounds to the nearest representable float and Morpho's checked
+        # `borrowShares -= repaidShares` would Panic(0x11). Sizing must be EXACT integer math.
+        ex.quote = _stub_quote(out_per_btc=61500, impact=0.008)
+        shares = 10 ** 27 + 7                       # deliberately not float-representable
+        t = _target(1.0, 61000.0)
+        t["borrow_shares_repaid"] = shares
+        ev = ex.evaluate(None, t, gas_usd=0.01)
+        self.assertEqual(ev["f"], 1.0)
+        self.assertEqual(ev["repaid_shares"], shares)               # bit-exact at full close
+        self.assertNotEqual(ev["repaid_shares"], int(shares * 1.0))  # the old bug
+
+    def test_exact_shares_fractional_chunk(self):
+        # chunked close: shares must scale as an exact rational, floor-rounded (never over)
+        def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005, **kw):
+            frac = amount_in_wei / (1.0 * 1e8)
+            impact = 0.03 * frac                    # forces a chunk-down
+            out = int(amount_in_wei / 1e8 * 63000 * 1e6)
+            return {"amount_out": out, "price_impact": impact, "gas": 400000,
+                    "swap_target": "0xAC4c6e212A361c968F1725b4d055b47E63F80b75",
+                    "swap_calldata": "0xbeef"}
+        ex.quote = q
+        shares = 10 ** 27 + 1
+        t = _target(1.0, 61000.0)
+        t["borrow_shares_repaid"] = shares
+        ev = ex.evaluate(None, t, gas_usd=0.01)
+        self.assertLess(ev["f"], 1.0)
+        num, den = [fr for fr in ex.CHUNK_FRACTIONS if fr[0] / fr[1] == ev["f"]][0]
+        self.assertEqual(ev["repaid_shares"], shares * num // den)
+        self.assertLessEqual(ev["repaid_shares"], shares)
 
 
 class TestCalldata(unittest.TestCase):
@@ -113,14 +148,39 @@ class TestGuards(unittest.TestCase):
         ok, _ = ex.guard_ok(st)
         self.assertFalse(ok)
 
-    def test_dedup_blocks_recent_ok(self):
+    def test_dedup_success_blocks_only_briefly(self):
+        # H6: after a confirmed success the remainder must be re-takeable within seconds —
+        # blocking (market,borrower) for 5min gifts the rest of a chunked close to competitors
         st = {"sent": {"k": {"ts": 1000.0, "status": "ok"}}}
+        self.assertTrue(ex.recently_fired(st, "k", 1000.0 + ex.DEDUP_OK_SEC - 1))
+        self.assertFalse(ex.recently_fired(st, "k", 1000.0 + ex.DEDUP_OK_SEC + 1))
+
+    def test_dedup_blocks_while_pending(self):
+        st = {"sent": {"k": {"ts": 1000.0, "status": "pending"}}}
         self.assertTrue(ex.recently_fired(st, "k", 1000.0 + ex.DEDUP_SEC - 1))
         self.assertFalse(ex.recently_fired(st, "k", 1000.0 + ex.DEDUP_SEC + 1))
 
     def test_dedup_allows_retry_after_revert(self):
         st = {"sent": {"k": {"ts": 1000.0, "status": "revert"}}}
         self.assertFalse(ex.recently_fired(st, "k", 1000.0 + 1))  # revert -> retry allowed
+
+    def test_lost_race_classification(self):
+        # H5: Morpho reverts Error("position is healthy") when beaten; Panic(0x11) on
+        # over-repay after a competitor's partial close — neither is a bot defect
+        self.assertTrue(ex._is_lost_race("execution reverted: position is healthy"))
+        self.assertTrue(ex._is_lost_race(
+            "rpc eth_call: {'code': 3, 'data': '0x4e487b71" + "0" * 62 + "11'}"))
+        self.assertFalse(ex._is_lost_race("execution reverted: custom error 0x1234abcd"))
+        self.assertFalse(ex._is_lost_race("SwapFailed()"))
+
+    def test_lost_race_not_counted_as_revert(self):
+        st = {"sent": {}, "consec_reverts": 0, "reverts": 0}
+        ex._record(st, "k", "0xabc", 1000.0, "lost_race")
+        self.assertEqual(st["consec_reverts"], 0)
+        self.assertEqual(st["reverts"], 0)
+        self.assertEqual(st["races_lost"], 1)
+        ex._record(st, "k", "0xabc", 1000.0, "revert")
+        self.assertEqual(st["consec_reverts"], 1)
 
 
 if __name__ == "__main__":

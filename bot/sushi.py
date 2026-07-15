@@ -78,11 +78,20 @@ def quote(token_in: str, token_out: str, amount_in_wei: int, sender: str, recipi
         except SushiError:
             raise
         except urllib.error.HTTPError as e:
-            # 4xx = the request/token is invalid — retrying won't help; skip the target.
-            if 400 <= e.code < 500:
+            # 429/408 are TRANSIENT (rate-limit/timeout — exactly what hot-poll cadence can
+            # provoke), retry like a 5xx; only other 4xx mean the request/token is invalid.
+            if e.code in (408, 429):
+                last = e
+                try:
+                    ra = float(e.headers.get("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    ra = 0.0
+                time.sleep(min(max(ra, 0.5 * (attempt + 1)), 5.0))
+            elif 400 <= e.code < 500:
                 raise NoRouteError(f"HTTP {e.code} (unsupported token/amount)") from e
-            last = e
-            time.sleep(0.5 * (attempt + 1))
+            else:
+                last = e
+                time.sleep(0.5 * (attempt + 1))
         except (OSError, ValueError) as e:
             last = e
             time.sleep(0.5 * (attempt + 1))

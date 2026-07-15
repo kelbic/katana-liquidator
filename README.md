@@ -35,10 +35,12 @@ DRY_RUN=1 KT_CONTRACT=0x25b5DeA89c8d337d0B040aBd10f8D69c2DfbCa45 python3 -m bot.
 
 The bot is deploy-ready but **never deploys or funds itself**. You do these three things:
 
-**1. Deploy the contract** (~1.2M gas ≈ $0.01 on Katana):
+**1. Install fire-path deps & deploy the contract** (~1.2M gas ≈ $0.01 on Katana):
 ```bash
-mkdir -p ~/.katana-bot && umask 077
-printf '0xYOUR_PRIVATE_KEY' > ~/.katana-bot/key   # 600-perm; owner of the liquidator
+pip install -r requirements.txt        # eth-abi + eth-account: REQUIRED for the live fire path
+(umask 077 && mkdir -p ~/.katana-bot)  # umask BEFORE mkdir so the dir itself is 700
+cat > ~/.katana-bot/key                # paste the key + Enter + Ctrl-D — keeps it out of
+                                       # bash history (unlike printf '0x…')
 KT_KEYFILE=~/.katana-bot/key ./bot/deploy.sh
 # -> copy "Deployed to: 0x…"
 ```

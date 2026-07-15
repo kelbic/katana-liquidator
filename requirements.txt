@@ -1,9 +1,9 @@
 # Read-only monitor + fork tests: STDLIB ONLY (nothing required here).
-# The executor's default signing path uses `cast` (foundry) — also no python deps.
 #
-# Optional: the in-process raw-tx signer (KT_RAW_TX=1) needs these. eth-abi/eth-utils are used
-# for calldata encoding on BOTH paths, but are already importable system-wide in this env;
-# pin them here for a clean venv. Install with: pip install -r requirements.txt
+# The executor's LIVE fire path REQUIRES these — eth-abi for calldata encoding on both signing
+# paths, eth-account for the default in-process signer (KT_RAW_TX=1; `cast` is the KT_RAW_TX=0
+# fallback). `pip install -r requirements.txt` is a mandatory go-live step; the executor's
+# startup preflight verifies the imports and exits loudly if anything is missing.
 eth-account>=0.11
 eth-abi>=5.0
 eth-utils>=4.0
