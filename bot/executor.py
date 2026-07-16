@@ -105,8 +105,10 @@ PRIORITY_GWEI = float(os.environ.get("KT_PRIORITY_GWEI", "0.001"))
 # Katana orders by gas price; the measured single-ticket PGA clears 171-443 gwei, so the default
 # 0.001 gwei never wins a contested single. When ON, we bid a fee competitive with the auction but
 # capped so we still keep FEE_BID_KEEP_USD of net after paying it. GO-LIVE REQUIRES: a funded wallet
-# (a win costs ~gas_units*bid ≈ $100-300) AND a raised KT_MAX_DAILY_GAS_USD (else one bid trips the
-# kill-switch). Losing a bid costs only the reverted gas. Never bids below FEE_BID_MIN_NET_USD tickets.
+# — the node needs balance >= GAS_LIMIT*maxFee, the FULL envelope: ~0.27-1.08 ETH at 148-600 gwei
+# bids (STATE.md funding table; enforced by check_balance) — AND a raised KT_MAX_DAILY_GAS_USD
+# (else one bid trips the kill-switch). A lost-but-included bid burns ~125-160k gas at the bid
+# price (~$71-90 @300 gwei). Never bids below FEE_BID_MIN_NET_USD tickets.
 FEE_BID = os.environ.get("KT_FEE_BID", "0") == "1"
 FEE_BID_MIN_NET_USD = float(os.environ.get("KT_FEE_BID_MIN_NET_USD", "300"))
 MAX_PRIORITY_GWEI = float(os.environ.get("KT_MAX_PRIORITY_GWEI", "600"))

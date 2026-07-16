@@ -12,18 +12,34 @@ ready. Stopped BEFORE live mainnet deploy (operator's key + funding = operator's
   time). Firing logic unchanged. Strengthens cascade-spillover capture (does NOT win contested
   singles — those are a priority-gas auction; see Phase 2).
 - _Phase 2 — competitive fee-bidding (BUILT, `KT_FEE_BID=0` DISABLED, needs review + funding):_
-  Katana orders single tickets by a priority-gas auction (measured 171-443 gwei); the default
-  0.001 gwei never wins one. Phase 2 bids a margin-capped competitive priority fee. OFF by default →
-  zero behaviour change until enabled. Code: `_competitive_priority_gwei` + `fire()`; tests
-  `TestFeeBid`. **Risk model:** a WON bid burns ~GAS_UNITS×bid ≈ $100-1000+ priority gas (recouped
-  from the $300-2000+ bonus); a LOST bid costs only reverted gas (~$47). The elevated win-cost is
-  charged to the daily gas kill-switch UP FRONT (conservative). **Knobs (set before enabling):**
-  `KT_FEE_BID=1`, `KT_FEE_BID_MIN_NET_USD=300` (only bid above this net), `KT_MAX_PRIORITY_GWEI=600`
-  (hard bid cap), `KT_FEE_BID_KEEP_USD=50` (min net kept after the bid), and **`KT_MAX_DAILY_GAS_USD`
-  MUST be raised** from $10 or one bid trips the kill-switch. **Go-live (after review + funding):**
-  (1) fund the Katana wallet `0x3E8E4B5EB633F5e3CdC5657A3BD16f01c080C4D5` (shared w/ WC) ~$50-100;
-  (2) set the knobs in `~/.katana-bot/env`; (3) restart (kill→cron), verify the banner + first
-  contested fire in TG. Kill-switch + on-chain minProfit still bound the downside.
+  Katana orders single tickets by a priority-gas auction (measured competitor bids 171-443 gwei);
+  the default 0.001 gwei never wins one. Phase 2 bids a margin-capped competitive priority fee.
+  OFF by default → zero behaviour change until enabled. Code: `_competitive_priority_gwei` +
+  `fire()`; tests `TestFeeBid`. **Risk model:** a WON bid burns ~GAS_UNITS×bid ≈ $100-1000+
+  priority gas (recouped from the $300-2000+ bonus); a LOST-but-included bid burns the reverted
+  gas at the bid price — measured ~125-160k gas, i.e. ~0.038-0.048 ETH ≈ **$71-90 at a 300 gwei
+  bid** (the earlier "~$47" understated it). The elevated win-cost is charged to the daily gas
+  kill-switch UP FRONT (conservative). **Knobs (set before enabling):** `KT_FEE_BID=1`,
+  `KT_FEE_BID_MIN_NET_USD=300` (only bid above this net), `KT_MAX_PRIORITY_GWEI=600` (hard bid
+  cap), `KT_FEE_BID_KEEP_USD=50` (min net kept after the bid), and **`KT_MAX_DAILY_GAS_USD`
+  MUST be raised** from $10 or one bid trips the kill-switch.
+  **Funding (corrected 2026-07-16 — the earlier "~$50-100" was 10-40× short):** the node REJECTS
+  a bid outright unless the EOA holds the FULL fee envelope, balance ≥ GAS_LIMIT(1,800,000) ×
+  maxFeePerGas (= 2×base + bid; Katana base ~0.001 gwei, negligible — the bid IS the fee).
+  Required balance by bid (@ ETH ≈ $1,878):
+
+  | bid (priority gwei) | required balance | ≈ USD |
+  |---|---:|---:|
+  | 148 — minimal competitive (net=$300 ticket) | 0.27 ETH | ~$500 |
+  | 300 — mid-auction (observed 171-443) | 0.54 ETH | ~$1,014 |
+  | 600 — `KT_MAX_PRIORITY_GWEI` cap | 1.08 ETH | ~$2,028 |
+
+  **Go-live (after review + funding):** (1) fund the Katana wallet
+  `0x3E8E4B5EB633F5e3CdC5657A3BD16f01c080C4D5` (shared w/ WC) per the table — the cap row if the
+  600 gwei cap stays. The executor now checks the EOA balance at startup + every ~10 min
+  (`check_balance`, alert below the fire-readiness floor); a clean balance preflight is a go-live
+  precondition. (2) set the knobs in `~/.katana-bot/env`; (3) restart (kill→cron), verify the
+  banner + first contested fire in TG. Kill-switch + on-chain minProfit still bound the downside.
 
 **Update 2026-07-15 — LIVE + hot-poll.** Deployed live (DRY_RUN=0). Diagnosed why it had 0 fires:
 NOT sizing/markets (measured — all ~$4.2M/500-liq flow is in the 6 registered markets; the
