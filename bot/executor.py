@@ -91,6 +91,16 @@ GAS_LIMIT = int(os.environ.get("KT_GAS_LIMIT", "1800000"))        # generous (li
 GAS_UNITS_EST = int(os.environ.get("KT_GAS_UNITS", "900000"))     # for gas-cost estimate
 CHAIN_ID = int(os.environ.get("KT_CHAIN_ID", "747474"))
 PRIORITY_GWEI = float(os.environ.get("KT_PRIORITY_GWEI", "0.001"))
+# Phase 2 — competitive priority-fee bidding on big CONTESTED tickets. DISABLED by default.
+# Katana orders by gas price; the measured single-ticket PGA clears 171-443 gwei, so the default
+# 0.001 gwei never wins a contested single. When ON, we bid a fee competitive with the auction but
+# capped so we still keep FEE_BID_KEEP_USD of net after paying it. GO-LIVE REQUIRES: a funded wallet
+# (a win costs ~gas_units*bid ≈ $100-300) AND a raised KT_MAX_DAILY_GAS_USD (else one bid trips the
+# kill-switch). Losing a bid costs only the reverted gas. Never bids below FEE_BID_MIN_NET_USD tickets.
+FEE_BID = os.environ.get("KT_FEE_BID", "0") == "1"
+FEE_BID_MIN_NET_USD = float(os.environ.get("KT_FEE_BID_MIN_NET_USD", "300"))
+MAX_PRIORITY_GWEI = float(os.environ.get("KT_MAX_PRIORITY_GWEI", "600"))
+FEE_BID_KEEP_USD = float(os.environ.get("KT_FEE_BID_KEEP_USD", "50"))
 MAX_DAILY_GAS_USD = float(os.environ.get("KT_MAX_DAILY_GAS_USD", "5"))
 MAX_CONSEC_REVERTS = int(os.environ.get("KT_MAX_CONSEC_REVERTS", "3"))
 DEDUP_SEC = int(os.environ.get("KT_DEDUP_SEC", "300"))
@@ -425,8 +435,22 @@ def _owner_address() -> str | None:
     return _owner_addr_cache or None
 
 
-def _fee_params() -> tuple[int, int]:
-    priority = int(PRIORITY_GWEI * 1e9)
+def _competitive_priority_gwei(net_usd) -> float:
+    """Phase 2: priority fee (gwei) to bid on a CONTESTED ticket — competitive with Katana's
+    priority-gas auction (measured 171-443 gwei) but capped so we still keep >= FEE_BID_KEEP_USD of
+    net after paying it. Returns the default PRIORITY_GWEI when fee-bidding is off / ticket too small.
+    net_usd is post-base-gas quoted net; the affordable bid burns (net - keep) into the tip."""
+    if not FEE_BID or net_usd is None or net_usd < FEE_BID_MIN_NET_USD:
+        return PRIORITY_GWEI
+    denom = GAS_UNITS_EST * ETH_USD / 1e9          # USD cost of 1 gwei of tip at GAS_UNITS_EST
+    affordable = (net_usd - FEE_BID_KEEP_USD) / denom if denom > 0 else 0.0
+    if affordable <= PRIORITY_GWEI:
+        return PRIORITY_GWEI
+    return min(MAX_PRIORITY_GWEI, affordable)
+
+
+def _fee_params(priority_gwei: float | None = None) -> tuple[int, int]:
+    priority = int((priority_gwei if priority_gwei is not None else PRIORITY_GWEI) * 1e9)
     try:
         blk = _rpc_write("eth_getBlockByNumber", ["latest", False])
         base = int(blk["baseFeePerGas"], 16)
@@ -492,11 +516,11 @@ def _settle(st: dict, key: str, txh: str, rcpt: dict, now_ts: float,
 
 
 def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: str,
-              gas_usd: float) -> None:
+              gas_usd: float, priority_gwei: float | None = None) -> None:
     from eth_account import Account
     try:
         addr = Account.from_key(PRIVATE_KEY).address
-        max_fee, priority = _fee_params()
+        max_fee, priority = _fee_params(priority_gwei)
         nonce = int(_rpc_write("eth_getTransactionCount", [addr, "pending"]), 16)
         tx = {"chainId": CHAIN_ID, "nonce": nonce, "to": _cs(CONTRACT), "value": 0,
               "gas": GAS_LIMIT, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority,
@@ -536,11 +560,12 @@ def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: st
 
 
 def _fire_cast(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: str,
-               gas_usd: float) -> None:
+               gas_usd: float, priority_gwei: float | None = None) -> None:
     # fallback path (KT_RAW_TX=0). Key via env, NOT argv — argv is world-readable in
     # /proc/*/cmdline for the whole cast run (review H3).
+    pg = priority_gwei if priority_gwei is not None else PRIORITY_GWEI
     args = ["cast", "send", CONTRACT, calldata, "--gas-limit", str(GAS_LIMIT),
-            "--rpc-url", RPC_WRITE]
+            "--priority-gas-price", str(int(pg * 1e9)), "--rpc-url", RPC_WRITE]
     try:
         r = subprocess.run(args, capture_output=True, text=True, timeout=120,
                            env=dict(os.environ, ETH_PRIVATE_KEY=PRIVATE_KEY))
@@ -594,11 +619,14 @@ def _check_pending(st: dict, now_ts: float) -> None:
 def fire(rpc: Rpc, t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -> None:
     key = f"{t['market_id']}:{t['borrower']}"
     nets = f"${ev['net_usd']:+,.1f}" if ev["net_usd"] is not None else f"{ev['net_wei']} wei"
+    # Phase 2: competitive priority bid on a big contested ticket (default off -> == PRIORITY_GWEI)
+    bid_gwei = _competitive_priority_gwei(ev["net_usd"])
+    bid_note = f" bid={bid_gwei:.0f}gwei" if bid_gwei > PRIORITY_GWEI else ""
     if DRY_RUN or not CONTRACT:
         mode = (f"seizedAssets={ev.get('seized_arg', 0)}" if ev.get("seized_arg")
                 else f"repaidShares={ev['repaid_shares']}")
         msg = (f"🧪 DRY_RUN: HF={t['hf']:.4f} chunk={ev['f']:.0%} {mode} "
-               f"net={nets} impact={ev['impact']*100:.2f}% mkt={t['market_id'][:10]} "
+               f"net={nets}{bid_note} impact={ev['impact']*100:.2f}% mkt={t['market_id'][:10]} "
                f"{t['borrower'][:10]}…; NOT sent.")
         print(msg)
         return
@@ -626,12 +654,19 @@ def fire(rpc: Rpc, t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -
             print(f"  preflight revert (NOT sent, zero gas): {why[:200]}")
         st["declined"][key] = {"ts": now_ts}
         return
+    fire_gas_usd = gas_usd
+    if bid_gwei > PRIORITY_GWEI:
+        # charge the elevated win-cost to the kill-switch UP FRONT (conservative: a lost bid only
+        # pays reverted gas, so this over-counts losses — trips the daily cap sooner, never later)
+        fire_gas_usd = GAS_UNITS_EST * bid_gwei / 1e9 * ETH_USD
+        print(f"  💸 fee-bid {bid_gwei:.0f} gwei (net {nets} > ${FEE_BID_MIN_NET_USD:.0f}); "
+              f"est win-cost ${fire_gas_usd:,.0f}, keeps ~${(ev['net_usd'] or 0) - fire_gas_usd:,.0f}")
     st["fires"] += 1
-    st["gas_usd"] += gas_usd
+    st["gas_usd"] += fire_gas_usd
     if RAW_TX:
-        _fire_raw(t, ev, st, now_ts, key, calldata, gas_usd)
+        _fire_raw(t, ev, st, now_ts, key, calldata, fire_gas_usd, bid_gwei)
     else:
-        _fire_cast(t, ev, st, now_ts, key, calldata, gas_usd)
+        _fire_cast(t, ev, st, now_ts, key, calldata, fire_gas_usd, bid_gwei)
 
 
 # --- guards --------------------------------------------------------------------

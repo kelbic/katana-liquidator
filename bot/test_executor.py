@@ -207,5 +207,39 @@ class TestGuards(unittest.TestCase):
         self.assertEqual(st["consec_reverts"], 1)
 
 
+class TestFeeBid(unittest.TestCase):
+    """Phase 2 competitive priority-fee bidding (_competitive_priority_gwei)."""
+    def setUp(self):
+        self._save = (ex.FEE_BID, ex.GAS_UNITS_EST, ex.ETH_USD, ex.MAX_PRIORITY_GWEI,
+                      ex.FEE_BID_MIN_NET_USD, ex.FEE_BID_KEEP_USD, ex.PRIORITY_GWEI)
+        ex.GAS_UNITS_EST, ex.ETH_USD, ex.MAX_PRIORITY_GWEI = 900000, 1900.0, 600.0
+        ex.FEE_BID_MIN_NET_USD, ex.FEE_BID_KEEP_USD, ex.PRIORITY_GWEI = 300.0, 50.0, 0.001
+
+    def tearDown(self):
+        (ex.FEE_BID, ex.GAS_UNITS_EST, ex.ETH_USD, ex.MAX_PRIORITY_GWEI,
+         ex.FEE_BID_MIN_NET_USD, ex.FEE_BID_KEEP_USD, ex.PRIORITY_GWEI) = self._save
+
+    def test_disabled_by_default(self):
+        ex.FEE_BID = False
+        self.assertEqual(ex._competitive_priority_gwei(50000), ex.PRIORITY_GWEI)
+
+    def test_no_bid_below_min_net(self):
+        ex.FEE_BID = True
+        self.assertEqual(ex._competitive_priority_gwei(250), ex.PRIORITY_GWEI)
+        self.assertIsNone(ex._competitive_priority_gwei(None) and None)  # None net -> default
+
+    def test_bid_is_capped(self):
+        ex.FEE_BID = True
+        self.assertEqual(ex._competitive_priority_gwei(50000), 600.0)   # huge net -> cap
+
+    def test_bid_keeps_floor(self):
+        ex.FEE_BID = True
+        g = ex._competitive_priority_gwei(800)                          # below cap -> margin-aware
+        cost = ex.GAS_UNITS_EST * g / 1e9 * ex.ETH_USD
+        self.assertLess(g, 600.0)
+        self.assertGreaterEqual(800 - cost, ex.FEE_BID_KEEP_USD - 1)    # keeps ~>= FEE_BID_KEEP_USD
+        self.assertLessEqual(800 - cost, ex.FEE_BID_KEEP_USD + 1)
+
+
 if __name__ == "__main__":
     unittest.main()

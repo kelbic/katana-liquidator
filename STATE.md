@@ -6,6 +6,25 @@ verdict + architecture + economics + decision log. Operator handoff steps are in
 Status as of **2026-07-13**: verification done, code built, **fork-tested end-to-end**, deploy-
 ready. Stopped BEFORE live mainnet deploy (operator's key + funding = operator's step).
 
+**Update 2026-07-16 — v2 increment 1 (LIVE) + Phase 2 (BUILT, DISABLED).**
+- _Increment 1 (deployed, commit e8e0704):_ hot set capped to top-25 by debt (was ~379, the whole
+  weETH/vbETH cluster), HOT_POLL_SEC 1s→0.3s. Hot pass ~4.4s→~0.5s; detection ~2.3s→~0.8s (≈ block
+  time). Firing logic unchanged. Strengthens cascade-spillover capture (does NOT win contested
+  singles — those are a priority-gas auction; see Phase 2).
+- _Phase 2 — competitive fee-bidding (BUILT, `KT_FEE_BID=0` DISABLED, needs review + funding):_
+  Katana orders single tickets by a priority-gas auction (measured 171-443 gwei); the default
+  0.001 gwei never wins one. Phase 2 bids a margin-capped competitive priority fee. OFF by default →
+  zero behaviour change until enabled. Code: `_competitive_priority_gwei` + `fire()`; tests
+  `TestFeeBid`. **Risk model:** a WON bid burns ~GAS_UNITS×bid ≈ $100-1000+ priority gas (recouped
+  from the $300-2000+ bonus); a LOST bid costs only reverted gas (~$47). The elevated win-cost is
+  charged to the daily gas kill-switch UP FRONT (conservative). **Knobs (set before enabling):**
+  `KT_FEE_BID=1`, `KT_FEE_BID_MIN_NET_USD=300` (only bid above this net), `KT_MAX_PRIORITY_GWEI=600`
+  (hard bid cap), `KT_FEE_BID_KEEP_USD=50` (min net kept after the bid), and **`KT_MAX_DAILY_GAS_USD`
+  MUST be raised** from $10 or one bid trips the kill-switch. **Go-live (after review + funding):**
+  (1) fund the Katana wallet `0x3E8E4B5EB633F5e3CdC5657A3BD16f01c080C4D5` (shared w/ WC) ~$50-100;
+  (2) set the knobs in `~/.katana-bot/env`; (3) restart (kill→cron), verify the banner + first
+  contested fire in TG. Kill-switch + on-chain minProfit still bound the downside.
+
 **Update 2026-07-15 — LIVE + hot-poll.** Deployed live (DRY_RUN=0). Diagnosed why it had 0 fires:
 NOT sizing/markets (measured — all ~$4.2M/500-liq flow is in the 6 registered markets; the
 persistent "no profitable chunk" declines are correct bad-debt dregs, coll≪debt). It was the flat
