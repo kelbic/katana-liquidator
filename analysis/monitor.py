@@ -65,6 +65,10 @@ REPORT_HF = 1.15        # risk table cutoff
 # (skip_api), so the hot loop re-reads only the imminent handful (~tens) instead of the whole book
 # (~hundreds) — keeps a hot pass sub-second so we actually catch a cross within the hot cadence.
 HOT_WATCH_HF = float(os.environ.get("KT_HOT_WATCH_HF", "1.05"))
+# Cap the hot set to the top-N imminent positions BY DEBT, so a big correlated cluster (weETH/vbETH:
+# hundreds hovering at HF~1.002) can't bloat the hot sweep. The biggest tickets are the only ones
+# worth a fast race; small ones are caught on the 30s full pass and are below-floor anyway. (v2)
+HOT_MAX_N = int(os.environ.get("KT_HOT_MAX_N", "25"))
 MIN_DEBT_USD = float(os.environ.get("KT_MIN_DEBT_USD", "500"))
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
@@ -337,10 +341,11 @@ def scan(rpc: Rpc | None = None, state: dict | None = None,
     # persist the hot subset (imminent, HF<HOT_WATCH_HF) that a hot pass re-sweeps on-chain, so a hot
     # pass touches only the imminent handful and stays sub-second. On skip_api passes we only swept
     # the hot subset, so keep the last full book rather than shrinking it to the hot set.
+    hot_rows = sorted((row for row in targets + risk if row["hf"] < HOT_WATCH_HF),
+                      key=lambda r: -(r.get("debt_usd") or 0))
     hot_pairs: dict = {}
-    for row in targets + risk:
-        if row["hf"] < HOT_WATCH_HF:
-            hot_pairs.setdefault(row["market_id"], set()).add(row["borrower"])
+    for row in hot_rows[:HOT_MAX_N]:
+        hot_pairs.setdefault(row["market_id"], set()).add(row["borrower"])
     new_state = {"last_block": to, "params": params,
                  "pairs": ({m: sorted(bs) for m, bs in pairs.items() if bs}
                            if not skip_api else state.get("pairs", {})),

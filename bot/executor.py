@@ -82,7 +82,8 @@ POLL_SEC = int(os.environ.get("KT_POLL_SEC", "20"))         # cadence when NOTHI
 # Hot-poll: when near-edge positions exist, re-read their HF on-chain this often (cheap; ~8ms RTT
 # to the Katana RPC from our region) so we catch a cross within ~HOT_POLL_SEC instead of ~POLL_SEC.
 # The Morpho-indexer set is refreshed only every API_REFRESH_SEC to avoid hammering the public API.
-HOT_POLL_SEC = float(os.environ.get("KT_HOT_POLL_SEC", "1"))
+HOT_POLL_SEC = float(os.environ.get("KT_HOT_POLL_SEC", "0.3"))  # v2: tight cadence on a small top-N
+#   hot set (~block time ~0.8s); effective detection ~0.6s. RPC load ~4-5 req/s, well under the 100/s cap.
 API_REFRESH_SEC = float(os.environ.get("KT_API_REFRESH_SEC", "30"))
 HOT_HF = float(os.environ.get("KT_HOT_HF", "1.02"))         # hot-poll only when a position is within
 #                                                             this HF of liquidation (imminent cross)
