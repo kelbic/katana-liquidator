@@ -31,7 +31,9 @@ Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFI
   KT_HEARTBEAT_SEC (86400), KT_RAW_TX (1=in-process eth_account [default], 0=cast fallback),
   DRY_RUN (1), KT_CHAT_ID + KT_TG_TOKEN (or the telegram channel env file) for alerts,
   KT_QUOTE_TIMEOUT (5) / KT_QUOTE_RETRIES (2) / KT_EVAL_DEADLINE_SEC (10) — fire-path quote
-  budget, KT_RECEIPT_WAIT_SEC (20), KT_DEDUP_OK_SEC (10) — post-success re-take delay.
+  budget, KT_RECEIPT_WAIT_SEC (20), KT_DEDUP_OK_SEC (10) — post-success re-take delay,
+  KT_WRITE_RPCS (comma-separated fallback write endpoints, rotated on transport failure),
+  KT_TRANSIENT_BACKOFF_SEC (2) — per-target retry backoff on write-RPC transport errors.
 
 Go-live preflight: `pip install -r requirements.txt` (eth_account for KT_RAW_TX=1) — the loop
 verifies deps/contract/chainId at startup and exits loudly if broken (never silently).
@@ -72,6 +74,11 @@ KEYFILE = os.path.expanduser(os.environ.get("KT_KEYFILE", "~/.katana-bot/key"))
 if not PRIVATE_KEY and os.path.exists(KEYFILE):
     PRIVATE_KEY = open(KEYFILE).read().strip()
 RPC_WRITE = os.environ.get("KT_RPC", "https://rpc.katana.network")
+# Optional fallback write endpoints (comma-separated): on a transport failure _rpc_write rotates
+# to the next one instead of erroring out — a single rate-limited/dying write ingress must not
+# blind the whole fire path exactly during a cascade.
+WRITE_RPCS = [RPC_WRITE] + [u.strip() for u in os.environ.get("KT_WRITE_RPCS", "").split(",")
+                            if u.strip() and u.strip() != RPC_WRITE]
 READ_RPCS = [os.environ["KT_READ_RPC"]] if os.environ.get("KT_READ_RPC") else None
 
 MIN_PROFIT_USD = float(os.environ.get("KT_MIN_PROFIT_USD", "20"))
@@ -110,6 +117,11 @@ DEDUP_SEC = int(os.environ.get("KT_DEDUP_SEC", "300"))
 # A short TTL re-checks them occasionally without spamming; a freshly-crossed target is never in
 # this cache so it's still evaluated instantly.
 DECLINE_TTL = float(os.environ.get("KT_DECLINE_TTL", "60"))
+# A write-RPC transport/rate-limit failure says NOTHING about the target — it must NOT decline
+# for DECLINE_TTL (a rate-limited endpoint in a cascade would self-ban every profitable target
+# for 60s). Instead: retry next tick, with this short per-target backoff so the hot loop doesn't
+# hammer a dying endpoint.
+TRANSIENT_BACKOFF_SEC = float(os.environ.get("KT_TRANSIENT_BACKOFF_SEC", "2"))
 HEARTBEAT_SEC = int(os.environ.get("KT_HEARTBEAT_SEC", "86400"))
 # In-process signing is the DEFAULT (review H3): the cast subprocess adds 0.5-2s to the fire
 # path and its own RPC round-trips. cast remains as the KT_RAW_TX=0 fallback.
@@ -387,36 +399,69 @@ def _cs(addr: str) -> str:
 
 # raw-tx write client (separate from the read-only Rpc whitelist) over a KEPT-ALIVE
 # connection — a fresh TCP+TLS handshake per call costs 2-3 RTT and the fire path stacks
-# several calls back-to-back (review H9). One transparent reconnect on a stale socket.
-_WRITE_URL = urllib.parse.urlsplit(RPC_WRITE)
+# several calls back-to-back (review H9). Transparent reconnect on a stale socket; on a
+# transport failure the endpoint rotates to the next KT_WRITE_RPCS fallback (if any).
+_WRITE_URLS = [urllib.parse.urlsplit(u) for u in WRITE_RPCS]
 _write_conn: http.client.HTTPConnection | None = None
+_write_idx = 0
+
+
+class RpcTransportError(RuntimeError):
+    """Write-RPC failure that says NOTHING about the target: timeout/refused/garbage body, or a
+    server-side JSON-RPC error (rate limit {"code":-32005}, internal, ...). Callers must back
+    off + retry — NEVER classify it as an execution revert or decline the target on it (a
+    rate-limited write RPC during a cascade would otherwise self-ban every profitable target)."""
+
+
+# JSON-RPC errors that ARE a genuine execution revert of our eth_call/tx: EIP-1474 code 3
+# (execution error, revert data attached), legacy -32015 "vm execution error", or a body
+# carrying "execution reverted"/revert data. EVERYTHING else — rate limits ({"code":-32005}),
+# -32603 internals, "insufficient funds", nonce noise — is NOT a verdict on the target.
+_REVERT_CODES = {3, -32015}
+
+
+def _is_revert_error(err) -> bool:
+    if not isinstance(err, dict):
+        return "execution reverted" in str(err).lower()
+    if err.get("code") in _REVERT_CODES:
+        return True
+    msg = str(err.get("message", "")).lower()
+    data = err.get("data")
+    return ("execution reverted" in msg or "revert" in msg
+            or (isinstance(data, str) and data.startswith("0x") and len(data) > 2))
 
 
 def _rpc_write(method: str, params: list, timeout: float = 15.0):
-    global _write_conn
+    global _write_conn, _write_idx
     body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-    d = None
-    for attempt in (0, 1):
+    d = last = None
+    for _ in range(max(2, len(_WRITE_URLS))):   # >=1 inline retry; each fallback gets one shot
+        u = _WRITE_URLS[_write_idx % len(_WRITE_URLS)]
         try:
             if _write_conn is None:
-                cls = (http.client.HTTPSConnection if _WRITE_URL.scheme == "https"
+                cls = (http.client.HTTPSConnection if u.scheme == "https"
                        else http.client.HTTPConnection)
-                _write_conn = cls(_WRITE_URL.netloc, timeout=timeout)
-            _write_conn.request("POST", _WRITE_URL.path or "/", body,
+                _write_conn = cls(u.netloc, timeout=timeout)
+            _write_conn.request("POST", u.path or "/", body,
                                 {"Content-Type": "application/json",
                                  "User-Agent": "Mozilla/5.0"})
             d = json.loads(_write_conn.getresponse().read())
             break
         except (OSError, http.client.HTTPException, ValueError) as e:
+            last = e
             try:
                 _write_conn.close()
             except Exception:
                 pass
             _write_conn = None
-            if attempt:
-                raise RuntimeError(f"rpc {method} transport: {e}") from e
+            _write_idx += 1     # rotate to the next write endpoint (no-op with a single one)
+    if d is None:
+        raise RpcTransportError(f"rpc {method} transport: {last}") from last
     if d.get("error"):
-        raise RuntimeError(f"rpc {method}: {d['error']}")
+        err = d["error"]
+        if _is_revert_error(err):
+            raise RuntimeError(f"rpc {method}: {err}")
+        raise RpcTransportError(f"rpc {method}: {err}")
     return d["result"]
 
 
@@ -476,7 +521,9 @@ def _is_lost_race(err_text: str) -> bool:
 def _preflight_call(calldata: str) -> tuple[bool, str]:
     """eth_call the EXACT liquidation tx before broadcasting: runs Morpho's real accrual +
     _isHealthy, so a lost race / stale calldata reverts here in ~10ms for zero gas instead of
-    on-chain (review H5/C3). Returns (ok, revert_text)."""
+    on-chain (review H5/C3). Returns (ok, revert_text) for a GENUINE revert; a transport /
+    rate-limit failure propagates as RpcTransportError — the caller backs off + retries, it
+    must never be mistaken for a revert verdict on the target."""
     call = {"to": _cs(CONTRACT), "data": calldata, "gas": hex(GAS_LIMIT)}
     frm = _owner_address()
     if frm:
@@ -484,6 +531,8 @@ def _preflight_call(calldata: str) -> tuple[bool, str]:
     try:
         _rpc_write("eth_call", [call, "latest"])
         return True, ""
+    except RpcTransportError:
+        raise
     except RuntimeError as e:
         return False, str(e)
 
@@ -642,7 +691,16 @@ def fire(rpc: Rpc, t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -
     except Exception:
         pass
     calldata = liquidate_calldata(t, ev)
-    ok, why = _preflight_call(calldata)
+    try:
+        ok, why = _preflight_call(calldata)
+    except RpcTransportError as e:
+        # transport/rate-limit is NOT a verdict on the target: declining it for DECLINE_TTL
+        # would self-ban every profitable target exactly during a cascade. Short per-target
+        # backoff (ttl override) so the hot loop doesn't hammer the endpoint; retry next tick.
+        st["declined"][key] = {"ts": now_ts, "ttl": TRANSIENT_BACKOFF_SEC}
+        print(f"  preflight transport (backoff {TRANSIENT_BACKOFF_SEC:.0f}s, retrying — "
+              f"NOT declined): {str(e)[:160]}")
+        return
     if not ok:
         if _is_lost_race(why):
             st["races_lost"] = st.get("races_lost", 0) + 1
@@ -702,9 +760,10 @@ def recently_fired(st: dict, key: str, now_ts: float) -> bool:
 
 def recently_declined(st: dict, key: str, now_ts: float) -> bool:
     """True if this target was declined ('no profitable chunk') within DECLINE_TTL — skip re-quoting
-    it (avoids hammering Sushi with the perpetual bad-debt dregs at hot-poll cadence)."""
+    it (avoids hammering Sushi with the perpetual bad-debt dregs at hot-poll cadence). A record may
+    carry its own shorter 'ttl' (transient write-RPC backoff — retry within seconds, not 60s)."""
     rec = st.get("declined", {}).get(key)
-    return bool(rec and (now_ts - rec["ts"]) < DECLINE_TTL)
+    return bool(rec and (now_ts - rec["ts"]) < rec.get("ttl", DECLINE_TTL))
 
 
 # --- pass / loop ---------------------------------------------------------------
@@ -801,8 +860,9 @@ def once(st: dict | None = None, mstate: dict | None = None, skip_api: bool = Fa
         print(f"  target {t['borrower'][:10]}… HF={t['hf']:.4f} chunk={ev['f']:.0%} "
               f"net={nets} impact={ev['impact']*100:.2f}%")
         fire(rpc, t, ev, st, now_ts, gas_usd)
-    # prune expired decline-cache entries so it can't grow unbounded
-    st["declined"] = {k: v for k, v in st["declined"].items() if now_ts - v["ts"] < DECLINE_TTL}
+    # prune expired decline-cache entries so it can't grow unbounded (per-record ttl override)
+    st["declined"] = {k: v for k, v in st["declined"].items()
+                      if now_ts - v["ts"] < v.get("ttl", DECLINE_TTL)}
     if own:
         save_state(st)
     # imminent = any position (target or near-edge) within HOT_HF of the liquidation line -> hot-poll

@@ -1,7 +1,9 @@
 """Offline tests for the executor's pure logic (no RPC, no network). The Sushi quote is stubbed
 so chunk selection, the profit gate, and calldata encoding are tested deterministically."""
+import json
 import os
 import unittest
+import urllib.parse
 
 os.environ.setdefault("DRY_RUN", "1")
 os.environ.setdefault("KT_MIN_PROFIT_USD", "20")
@@ -205,6 +207,162 @@ class TestGuards(unittest.TestCase):
         self.assertEqual(st["races_lost"], 1)
         ex._record(st, "k", "0xabc", 1000.0, "revert")
         self.assertEqual(st["consec_reverts"], 1)
+
+
+class _StubConn:
+    """Stands in for the kept-alive write connection: returns a canned HTTP body once."""
+    def __init__(self, payload: bytes):
+        self._payload = payload
+
+    def request(self, *a, **k):
+        pass
+
+    def getresponse(self):
+        payload = self._payload
+
+        class R:
+            def read(self):
+                return payload
+        return R()
+
+    def close(self):
+        pass
+
+
+class TestRpcErrorClassification(unittest.TestCase):
+    """Transport/rate-limit vs execution revert: only a GENUINE revert may ever decline a
+    target — a rate-limited write RPC ({"code":-32005}) in a cascade used to be raised as the
+    same bare RuntimeError and self-banned every profitable target for DECLINE_TTL."""
+
+    def setUp(self):
+        self._save = (ex._WRITE_URLS, ex._write_conn, ex._write_idx)
+        # unreachable fallback (discard port): a reconnect attempt fails instantly, offline
+        ex._WRITE_URLS = [urllib.parse.urlsplit("http://127.0.0.1:9")]
+        ex._write_idx = 0
+
+    def tearDown(self):
+        (ex._WRITE_URLS, ex._write_conn, ex._write_idx) = self._save
+
+    @staticmethod
+    def _rpc_error(err: dict) -> bytes:
+        return json.dumps({"jsonrpc": "2.0", "id": 1, "error": err}).encode()
+
+    def test_is_revert_error(self):
+        # genuine reverts: EIP-1474 code 3, legacy -32015, message/data-carried revert
+        self.assertTrue(ex._is_revert_error(
+            {"code": 3, "message": "execution reverted", "data": "0x08c379a0" + "00" * 32}))
+        self.assertTrue(ex._is_revert_error({"code": -32015, "message": "vm execution error"}))
+        self.assertTrue(ex._is_revert_error(
+            {"code": -32000, "message": "execution reverted: position is healthy"}))
+        self.assertTrue(ex._is_revert_error({"code": -32000, "data": "0x4e487b71" + "00" * 32}))
+        # NOT reverts: rate limit, internal, send-path noise
+        self.assertFalse(ex._is_revert_error({"code": -32005, "message": "limit exceeded"}))
+        self.assertFalse(ex._is_revert_error({"code": -32603, "message": "internal error"}))
+        self.assertFalse(ex._is_revert_error(
+            {"code": -32000, "message": "insufficient funds for gas * price + value"}))
+        self.assertFalse(ex._is_revert_error({"code": -32000, "message": "nonce too low"}))
+
+    def test_rate_limit_raises_transport(self):
+        ex._write_conn = _StubConn(self._rpc_error({"code": -32005, "message": "rate limit"}))
+        with self.assertRaises(ex.RpcTransportError):
+            ex._rpc_write("eth_call", [])
+
+    def test_revert_raises_plain_runtime(self):
+        ex._write_conn = _StubConn(self._rpc_error(
+            {"code": 3, "message": "execution reverted: position is healthy"}))
+        try:
+            ex._rpc_write("eth_call", [])
+            self.fail("expected a revert RuntimeError")
+        except ex.RpcTransportError:
+            self.fail("genuine revert misclassified as transport")
+        except RuntimeError as e:
+            self.assertIn("healthy", str(e))
+
+    def test_garbage_body_is_transport_and_rotates(self):
+        # rate-limit bodies often come as HTML/garbage — must be transport, and the endpoint
+        # index must rotate to the next KT_WRITE_RPCS fallback
+        ex._write_conn = _StubConn(b"<html>502 Bad Gateway</html>")
+        with self.assertRaises(ex.RpcTransportError):
+            ex._rpc_write("eth_call", [])
+        self.assertGreater(ex._write_idx, 0)
+
+    def test_preflight_propagates_transport_but_returns_revert(self):
+        orig = ex._rpc_write
+        try:
+            def limited(method, params, timeout=15.0):
+                raise ex.RpcTransportError("rpc eth_call: {'code': -32005}")
+            ex._rpc_write = limited
+            with self.assertRaises(ex.RpcTransportError):
+                ex._preflight_call("0x79755efe")
+
+            def reverted(method, params, timeout=15.0):
+                raise RuntimeError("rpc eth_call: {'code': 3, 'message': "
+                                   "'execution reverted: position is healthy'}")
+            ex._rpc_write = reverted
+            ok, why = ex._preflight_call("0x79755efe")
+            self.assertFalse(ok)
+            self.assertTrue(ex._is_lost_race(why))
+        finally:
+            ex._rpc_write = orig
+
+
+class _StubRpc:
+    """Oracle re-read stub for fire(): returns the scan price (no adverse move)."""
+    def __init__(self, price):
+        self._price = price
+
+    def eth_call(self, to, data):
+        return hex(self._price)
+
+
+class TestFireTransportBackoff(unittest.TestCase):
+    """fire() on a preflight transport failure: short TRANSIENT_BACKOFF_SEC backoff, NOT the
+    60s DECLINE_TTL self-ban; a genuine preflight revert still declines for the full TTL."""
+
+    def setUp(self):
+        self._save = (ex.DRY_RUN, ex.quote, ex._preflight_call, ex.alert)
+        ex.DRY_RUN = False
+        ex.quote = _stub_quote(out_per_btc=61500, impact=0.008)
+        ex.alert = lambda text, sync=False: None
+
+    def tearDown(self):
+        (ex.DRY_RUN, ex.quote, ex._preflight_call, ex.alert) = self._save
+
+    def _fresh(self):
+        t = _target(1.0, 61000.0)
+        ev = ex.evaluate(None, t, gas_usd=0.01)
+        st = {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0,
+              "consec_reverts": 0, "reverts": 0}
+        return t, ev, st, f"{t['market_id']}:{t['borrower']}"
+
+    def test_transport_backs_off_briefly_not_60s(self):
+        t, ev, st, key = self._fresh()
+
+        def boom(calldata):
+            raise ex.RpcTransportError("rpc eth_call: {'code': -32005, 'message': 'rate limit'}")
+        ex._preflight_call = boom
+        ex.fire(_StubRpc(t["price"]), t, ev, st, 1000.0, 0.01)
+        self.assertEqual(st["declined"][key].get("ttl"), ex.TRANSIENT_BACKOFF_SEC)
+        self.assertTrue(ex.recently_declined(st, key, 1000.0 + ex.TRANSIENT_BACKOFF_SEC - 0.5))
+        self.assertFalse(ex.recently_declined(st, key, 1000.0 + ex.TRANSIENT_BACKOFF_SEC + 0.5))
+        self.assertEqual(st["fires"], 0)         # never sent, never charged
+        self.assertEqual(st["gas_usd"], 0.0)
+        self.assertEqual(st["consec_reverts"], 0)
+
+    def test_true_preflight_revert_declines_full_ttl(self):
+        t, ev, st, key = self._fresh()
+        ex._preflight_call = lambda calldata: (False, "execution reverted: SwapFailed()")
+        ex.fire(_StubRpc(t["price"]), t, ev, st, 1000.0, 0.01)
+        self.assertNotIn("ttl", st["declined"][key])
+        self.assertTrue(ex.recently_declined(st, key, 1000.0 + ex.DECLINE_TTL - 1))
+        self.assertFalse(ex.recently_declined(st, key, 1000.0 + ex.DECLINE_TTL + 1))
+
+    def test_lost_race_preflight_still_counted(self):
+        t, ev, st, key = self._fresh()
+        ex._preflight_call = lambda calldata: (False, "execution reverted: position is healthy")
+        ex.fire(_StubRpc(t["price"]), t, ev, st, 1000.0, 0.01)
+        self.assertEqual(st.get("races_lost"), 1)
+        self.assertIn(key, st["declined"])
 
 
 class TestFeeBid(unittest.TestCase):
