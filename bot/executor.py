@@ -1051,8 +1051,10 @@ def loop() -> None:
         alert(banner)
     st["last_heartbeat"] = time.time()
     last_api = 0.0
+    n_hot = 0   # preserved across passes: an exception in once() must NOT drop a hot cascade
+    #             to the idle POLL_SEC cadence — keep the last known hot count until a pass
+    #             completes (resetting it per-iteration slept 20s with positions at the edge)
     while True:
-        n_hot = 0
         try:
             # refresh the Morpho-indexer borrower set every API_REFRESH_SEC; between refreshes,
             # re-read the cached set's HF on-chain (skip_api) so we can hot-poll cheaply.
