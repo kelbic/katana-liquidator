@@ -365,6 +365,115 @@ class TestFireTransportBackoff(unittest.TestCase):
         self.assertIn(key, st["declined"])
 
 
+class TestSendErrorHandling(unittest.TestCase):
+    """Send errors (insufficient funds / RPC down mid-send) must cool the target down and
+    throttle alerts — an unfunded wallet used to re-quote + re-fire + TG-alert every ~1s."""
+
+    def test_send_error_cooldown(self):
+        st = {"sent": {"k": {"ts": 1000.0, "status": "send_error"}}}
+        self.assertTrue(ex.recently_fired(st, "k", 1000.0 + ex.SEND_ERR_COOLDOWN_SEC - 1))
+        self.assertFalse(ex.recently_fired(st, "k", 1000.0 + ex.SEND_ERR_COOLDOWN_SEC + 1))
+
+    def test_alert_throttled_per_target_and_globally(self):
+        alerts = []
+        save = ex.alert
+        ex.alert = lambda text, sync=False: alerts.append(text)
+        try:
+            st = {"sent": {}, "gas_usd": 0.05}
+            ex._record_send_error(st, "a", 1000.0, 0.01, "insufficient funds", "send")
+            self.assertEqual(len(alerts), 1)
+            self.assertEqual(st["sent"]["a"]["status"], "send_error")
+            self.assertAlmostEqual(st["gas_usd"], 0.04)          # gas estimate refunded
+            # same target again inside SEND_ERR_ALERT_SEC -> throttled
+            ex._record_send_error(st, "a", 1031.0, 0.01, "insufficient funds", "send")
+            self.assertEqual(len(alerts), 1)
+            # ANOTHER target inside the global window -> throttled too (cascade = N targets)
+            ex._record_send_error(st, "b", 1032.0, 0.01, "insufficient funds", "send")
+            self.assertEqual(len(alerts), 1)
+            # another target past the global window -> alerts
+            ex._record_send_error(st, "b", 1000.0 + ex.SEND_ERR_ALERT_GLOBAL_SEC + 33,
+                                  0.01, "insufficient funds", "send")
+            self.assertEqual(len(alerts), 2)
+            # same target past its per-target window -> alerts again
+            ex._record_send_error(st, "a", 1000.0 + ex.SEND_ERR_ALERT_SEC + 200,
+                                  0.01, "insufficient funds", "send")
+            self.assertEqual(len(alerts), 3)
+        finally:
+            ex.alert = save
+
+
+class TestBalanceCheck(unittest.TestCase):
+    """EOA gas-balance guard: the node needs balance >= GAS_LIMIT*maxFeePerGas (the FULL fee
+    envelope — ~1.08 ETH at the 600 gwei bid cap), so 'fund $50-100' can never fire a bid."""
+
+    def setUp(self):
+        self._save = (ex.FEE_BID, ex.GAS_LIMIT, ex.GAS_UNITS_EST, ex.MAX_PRIORITY_GWEI,
+                      ex.PRIORITY_GWEI, ex.BALANCE_FIRES, ex._owner_addr_cache,
+                      ex._rpc_write, ex.alert, ex._last_balance_check)
+        ex.GAS_LIMIT, ex.GAS_UNITS_EST = 1_800_000, 900_000
+        ex.MAX_PRIORITY_GWEI, ex.PRIORITY_GWEI, ex.BALANCE_FIRES = 600.0, 0.001, 3
+        ex._owner_addr_cache = "0x" + "11" * 20
+        ex._last_balance_check = 0.0
+        self.alerts = []
+        ex.alert = lambda text, sync=False: self.alerts.append(text)
+        self.balance = 0
+
+        def rpc(method, params, timeout=15.0):
+            if method == "eth_getBalance":
+                return hex(self.balance)
+            if method == "eth_getBlockByNumber":
+                return {"baseFeePerGas": hex(1_000_000)}   # Katana base ~0.001 gwei
+            raise AssertionError(f"unexpected write call {method}")
+        ex._rpc_write = rpc
+
+    def tearDown(self):
+        (ex.FEE_BID, ex.GAS_LIMIT, ex.GAS_UNITS_EST, ex.MAX_PRIORITY_GWEI,
+         ex.PRIORITY_GWEI, ex.BALANCE_FIRES, ex._owner_addr_cache,
+         ex._rpc_write, ex.alert, ex._last_balance_check) = self._save
+
+    def test_fee_bid_needs_full_envelope(self):
+        # bid cap 600 gwei -> envelope GAS_LIMIT*(2*base+cap) ≈ 1.08 ETH (STATE.md table);
+        # a '$50-100' funding (~0.03-0.05 ETH) is 10-40x short and must alert
+        ex.FEE_BID = True
+        self.balance = int(0.5e18)
+        self.assertFalse(ex.check_balance({}, 1e9, force=True))
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("LOW GAS BALANCE", self.alerts[0])
+        self.balance = int(1.2e18)                       # above the 1.08 ETH envelope
+        self.assertTrue(ex.check_balance({}, 1e9, force=True))
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_default_tip_floor_is_tiny(self):
+        # fee-bidding off: floor = K fires at the default tip ≈ 5.4e12 wei — 0.01 ETH passes
+        ex.FEE_BID = False
+        self.balance = int(1e16)
+        self.assertTrue(ex.check_balance({}, 1e9, force=True))
+        self.assertEqual(self.alerts, [])
+
+    def test_low_balance_alert_throttled(self):
+        ex.FEE_BID = True
+        self.balance = 0
+        st = {}
+        self.assertFalse(ex.check_balance(st, 1e9, force=True))
+        self.assertFalse(ex.check_balance(st, 1e9 + 60, force=True))     # < BALANCE_ALERT_SEC
+        self.assertEqual(len(self.alerts), 1)                            # throttled
+        self.assertFalse(ex.check_balance(st, 1e9 + ex.BALANCE_ALERT_SEC + 1, force=True))
+        self.assertEqual(len(self.alerts), 2)
+
+    def test_periodic_check_gated_by_cadence(self):
+        ex.FEE_BID = True
+        self.balance = 0
+        st = {}
+        self.assertFalse(ex.check_balance(st, 1e9))          # first periodic check runs
+        self.assertTrue(ex.check_balance(st, 1e9 + 1))       # inside BALANCE_CHECK_SEC -> skip
+        self.assertEqual(len(self.alerts), 1)
+
+    def test_no_key_no_check(self):
+        ex._owner_addr_cache = ""                            # no derivable EOA -> skip silently
+        self.assertTrue(ex.check_balance({}, 1e9, force=True))
+        self.assertEqual(self.alerts, [])
+
+
 class TestFeeBid(unittest.TestCase):
     """Phase 2 competitive priority-fee bidding (_competitive_priority_gwei)."""
     def setUp(self):

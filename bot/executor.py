@@ -33,7 +33,10 @@ Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFI
   KT_QUOTE_TIMEOUT (5) / KT_QUOTE_RETRIES (2) / KT_EVAL_DEADLINE_SEC (10) — fire-path quote
   budget, KT_RECEIPT_WAIT_SEC (20), KT_DEDUP_OK_SEC (10) — post-success re-take delay,
   KT_WRITE_RPCS (comma-separated fallback write endpoints, rotated on transport failure),
-  KT_TRANSIENT_BACKOFF_SEC (2) — per-target retry backoff on write-RPC transport errors.
+  KT_TRANSIENT_BACKOFF_SEC (2) — per-target retry backoff on write-RPC transport errors,
+  KT_SEND_ERR_COOLDOWN_SEC (30) + KT_SEND_ERR_ALERT_SEC (600) / KT_SEND_ERR_ALERT_GLOBAL_SEC
+  (60) — send-error target cooldown + alert throttles, KT_BALANCE_CHECK_SEC (600) /
+  KT_BALANCE_ALERT_SEC (3600) / KT_BALANCE_FIRES (3) — EOA gas-balance guard.
 
 Go-live preflight: `pip install -r requirements.txt` (eth_account for KT_RAW_TX=1) — the loop
 verifies deps/contract/chainId at startup and exits loudly if broken (never silently).
@@ -122,6 +125,22 @@ DECLINE_TTL = float(os.environ.get("KT_DECLINE_TTL", "60"))
 # for 60s). Instead: retry next tick, with this short per-target backoff so the hot loop doesn't
 # hammer a dying endpoint.
 TRANSIENT_BACKOFF_SEC = float(os.environ.get("KT_TRANSIENT_BACKOFF_SEC", "2"))
+# Send errors (insufficient funds / bad nonce / RPC down mid-send) are NOT reverts, but without
+# a cooldown an unfunded wallet re-ran the FULL evaluate (up to 8 Sushi quotes) + re-fired + TG
+# alert for the same target EVERY hot tick (~1s). Cooldown via the sent journal; alerts throttled
+# per-target AND globally.
+SEND_ERR_COOLDOWN_SEC = float(os.environ.get("KT_SEND_ERR_COOLDOWN_SEC", "30"))
+SEND_ERR_ALERT_SEC = float(os.environ.get("KT_SEND_ERR_ALERT_SEC", "600"))        # per target
+SEND_ERR_ALERT_GLOBAL_SEC = float(os.environ.get("KT_SEND_ERR_ALERT_GLOBAL_SEC", "60"))
+# EOA gas-balance guard: the node REJECTS a tx outright unless balance >= GAS_LIMIT*maxFeePerGas
+# — the FULL fee envelope, which with KT_FEE_BID is GAS_LIMIT*(2*base + KT_MAX_PRIORITY_GWEI)
+# ≈ 1.08 ETH at the 600 gwei cap, NOT the ~$0.005 a default-tip fire burns (see STATE.md table).
+# Checked at startup + every BALANCE_CHECK_SEC; low-balance alert throttled to BALANCE_ALERT_SEC.
+# BALANCE_FIRES = K fires of headroom at the default tip on top of one max-bid envelope: K=3 ≈ a
+# cascade's back-to-back fires (profit is swept in the LOAN token — wins never refill gas ETH).
+BALANCE_CHECK_SEC = float(os.environ.get("KT_BALANCE_CHECK_SEC", "600"))
+BALANCE_ALERT_SEC = float(os.environ.get("KT_BALANCE_ALERT_SEC", "3600"))
+BALANCE_FIRES = int(os.environ.get("KT_BALANCE_FIRES", "3"))
 HEARTBEAT_SEC = int(os.environ.get("KT_HEARTBEAT_SEC", "86400"))
 # In-process signing is the DEFAULT (review H3): the cast subprocess adds 0.5-2s to the fire
 # path and its own RPC round-trips. cast remains as the KT_RAW_TX=0 fallback.
@@ -564,6 +583,28 @@ def _settle(st: dict, key: str, txh: str, rcpt: dict, now_ts: float,
     return f"{status} {why[:160]}"
 
 
+def _record_send_error(st: dict, key: str, now_ts: float, gas_usd: float, e, what: str) -> None:
+    """A failed send (insufficient funds / bad nonce / RPC down mid-send) is NOT a revert
+    (review M10): refund the gas estimate, don't feed the kill-switch. But it must not retry at
+    hot-tick cadence either — the send_error journal entry cools the target down for
+    SEND_ERR_COOLDOWN_SEC (see recently_fired) and the alert is throttled per-target
+    (SEND_ERR_ALERT_SEC) + globally (SEND_ERR_ALERT_GLOBAL_SEC): an unfunded wallet used to
+    re-quote + re-fire + alert EVERY ~1s hot tick, per target, until topped up."""
+    st["gas_usd"] -= gas_usd
+    st["sent"][key] = {"tx": f"senderr:{e}"[:200], "ts": now_ts, "status": "send_error"}
+    seen = st.setdefault("send_err_alerted", {})
+    if (now_ts - seen.get(key, 0) > SEND_ERR_ALERT_SEC
+            and now_ts - st.get("last_send_err_alert", 0) > SEND_ERR_ALERT_GLOBAL_SEC):
+        seen[key] = now_ts
+        st["last_send_err_alert"] = now_ts
+        alert(f"⚠️ {what} error (not counted as revert; target cooldown "
+              f"{SEND_ERR_COOLDOWN_SEC:.0f}s): {str(e)[:200]}")
+    else:
+        print(f"  {what} error (alert throttled): {str(e)[:200]}")
+    for k in [k for k, ts in seen.items() if now_ts - ts > 86400]:   # prune
+        del seen[k]
+
+
 def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: str,
               gas_usd: float, priority_gwei: float | None = None) -> None:
     from eth_account import Account
@@ -580,10 +621,8 @@ def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: st
         txh = _rpc_write("eth_sendRawTransaction", [raw_hex])
     except Exception as e:
         # transport/signing failure BEFORE broadcast is NOT a revert (review M10): refund the
-        # gas estimate, don't feed the kill-switch, retry next tick.
-        st["gas_usd"] -= gas_usd
-        st["sent"][key] = {"tx": f"senderr:{e}"[:200], "ts": now_ts, "status": "send_error"}
-        alert(f"⚠️ send error (not counted as revert): {e}")
+        # gas estimate, don't feed the kill-switch; cooldown + throttled alert.
+        _record_send_error(st, key, now_ts, gas_usd, e, "send")
         return
     # alert strictly AFTER broadcast, fire-and-forget (review H2)
     alert(f"🔫 sent {txh} HF={t['hf']:.4f} chunk={ev['f']:.0%} {t['borrower'][:10]}…")
@@ -626,9 +665,7 @@ def _fire_cast(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: s
         _record(st, key, out[-80:].strip(), now_ts, status)
         alert(f"{'✅ liq ok' if status == 'ok' else '❌ ' + status}: {out[-300:]}")
     except Exception as e:
-        st["gas_usd"] -= gas_usd
-        st["sent"][key] = {"tx": f"senderr:{e}"[:200], "ts": now_ts, "status": "send_error"}
-        alert(f"⚠️ cast error (not counted as revert): {e}")
+        _record_send_error(st, key, now_ts, gas_usd, e, "cast")
 
 
 def _record(st: dict, key: str, tx: str, now_ts: float, status: str) -> None:
@@ -744,8 +781,10 @@ def recently_fired(st: dict, key: str, now_ts: float) -> bool:
     """Dedup policy (review H6): block while a tx is IN-FLIGHT (pending); after a confirmed
     success block only briefly (DEDUP_OK_SEC) — the next pass re-reads live borrowShares, so
     the REMAINDER of a chunked close is re-taken immediately instead of gifted to competitors
-    for 5min (Morpho has no close factor). Reverts/lost races/send errors retry at once —
-    real reverts are capped by the consec-reverts guard."""
+    for 5min (Morpho has no close factor). Reverts/lost races retry at once — real reverts are
+    capped by the consec-reverts guard; send errors (unfunded wallet, RPC down mid-send) cool
+    down for SEND_ERR_COOLDOWN_SEC — they'd otherwise re-run the full evaluate + alert every
+    hot tick until the condition clears."""
     rec = st["sent"].get(key)
     if not rec:
         return False
@@ -755,6 +794,8 @@ def recently_fired(st: dict, key: str, now_ts: float) -> bool:
         return age < DEDUP_SEC
     if status == "ok":
         return age < DEDUP_OK_SEC
+    if status == "send_error":
+        return age < SEND_ERR_COOLDOWN_SEC
     return False
 
 
@@ -900,6 +941,47 @@ def heartbeat(st: dict) -> None:
           f"DRY_RUN={'on' if DRY_RUN else 'OFF'}.")
 
 
+_last_balance_check = 0.0
+
+
+def check_balance(st: dict, now_ts: float, force: bool = False) -> bool:
+    """EOA gas-balance guard (there was NONE — a drained wallet only surfaced as an
+    'insufficient funds' send-error storm mid-cascade). The node REJECTS a tx unless
+    balance >= GAS_LIMIT*maxFeePerGas, i.e. the FULL fee envelope: with KT_FEE_BID that is
+    GAS_LIMIT*(2*base + KT_MAX_PRIORITY_GWEI) ≈ 1.08 ETH at the 600 gwei cap (see STATE.md —
+    funding '$50-100' was 10-40x short). Fire-readiness floor = max(one max-bid envelope,
+    BALANCE_FIRES fires' burn at the default tip). Cheap: one eth_getBalance + one header per
+    BALANCE_CHECK_SEC. Returns False (+ throttled TG alert) when underfunded."""
+    global _last_balance_check
+    if not force and now_ts - _last_balance_check < BALANCE_CHECK_SEC:
+        return True
+    addr = _owner_address()
+    if not addr:
+        return True
+    _last_balance_check = now_ts
+    try:
+        bal = int(_rpc_write("eth_getBalance", [addr, "latest"]), 16)
+        max_fee, cap_wei = _fee_params(MAX_PRIORITY_GWEI if FEE_BID else PRIORITY_GWEI)
+        base = max(0, (max_fee - cap_wei) // 2)
+        per_fire = GAS_UNITS_EST * (base + int(PRIORITY_GWEI * 1e9))
+        need = max(GAS_LIMIT * max_fee, BALANCE_FIRES * per_fire)
+    except Exception as e:
+        print(f"balance check failed (skipped): {e}")
+        return True
+    st["balance_eth"] = round(bal / 1e18, 6)
+    if bal >= need:
+        return True
+    msg = (f"⛽ LOW GAS BALANCE: {bal / 1e18:.4f} ETH < floor {need / 1e18:.4f} ETH "
+           f"(node needs GAS_LIMIT×maxFee = {GAS_LIMIT * max_fee / 1e18:.4f} ETH per fire"
+           f"{f' at the {MAX_PRIORITY_GWEI:.0f} gwei bid cap' if FEE_BID else ''}; "
+           f"headroom K={BALANCE_FIRES} fires). Top up {addr}.")
+    print(msg)
+    if now_ts - st.get("last_balance_alert", 0) > BALANCE_ALERT_SEC:
+        st["last_balance_alert"] = now_ts
+        alert(msg)
+    return False
+
+
 def startup_preflight() -> None:
     """Fail LOUD at start instead of silently in the fire path (review C2): the live fire path
     imports eth_abi/eth_account lazily and DRY_RUN returns before reaching it, so a missing
@@ -937,6 +1019,12 @@ def startup_preflight() -> None:
                     probs.append(f"no code at KT_CONTRACT {CONTRACT}")
             except Exception as e:
                 warns.append(f"write-RPC preflight failed (will retry in-loop): {e}")
+        # EOA gas-balance guard (go-live precondition; re-checked periodically in the loop)
+        if _owner_address():
+            st = load_state()
+            if not check_balance(st, time.time(), force=True):
+                warns.append("EOA gas balance below the fire-readiness floor (TG alert sent)")
+            save_state(st)
     for w in warns:
         print(f"preflight warning: {w}")
     if probs:
@@ -984,6 +1072,8 @@ def loop() -> None:
         except Exception as e:
             print(f"loop err: {e}")
         heartbeat(st)
+        if not DRY_RUN:
+            check_balance(st, time.time())   # periodic EOA gas guard (throttled internally)
         save_state(st)
         # hot cadence when a position is within HOT_HF of liquidation, else idle cadence
         time.sleep(HOT_POLL_SEC if n_hot > 0 else POLL_SEC)
