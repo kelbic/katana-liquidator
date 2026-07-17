@@ -49,6 +49,16 @@ Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFI
   KT_MEMPOOL_MAX_TIP_GWEI (0.5) — matched-tip safety ceiling above which a same-block fire keeps
   preflight (never blind-fires high), KT_MEMPOOL_SEND_URL (=KT_RPC) — same-block write lane,
   KT_MEMPOOL_WSS_URL (wss://rpc.katanarpc.com) / KT_MEMPOOL_HTTP_URL (https://rpc.katanarpc.com),
+  KT_PREDICT (0) — oracle-push prediction pre-arm layer (bot/pricefeed.py + bot/predict.py):
+  watch Binance BTC/ETH, predict the on-chain Chainlink push ~30-40s early, and PRE-ARM (widen the
+  pre-signed set) — NEVER fires (the mempool/fast path still fires on the real push),
+  KT_PREDICT_SHADOW (1) — default ON: measure lead-time/FP, log PREDICT lines, no pre-arm,
+  KT_PREDICT_LIVE (0) — real pre-arm (needs SHADOW=0), still never fires on its own,
+  KT_PREDICT_ARM_PCT (0.0045) / KT_PREDICT_DISARM_PCT (0.0035) — arm/retrace hysteresis on
+  |return| from the anchor, KT_PREDICT_FALSEPOS_WINDOW (90) — stuck-arm FP timeout (s),
+  KT_PREDICT_ARM_HF (1.006) / KT_PREDICT_ARM_MAX_N (8) — widened arm ceiling/cap for a live-
+  pre-armed feed's markets, KT_PREDICT_POLL_SEC (2) — aggregator latestRoundData push poll,
+  KT_PREDICT_WS_URL (wss://stream.binance.com:9443/ws) / KT_PREDICT_SYMBOLS (BTCUSDT,ETHUSDT),
   KT_RACE_ALERT_MIN_USD (=KT_MIN_PROFIT_USD) — only alert competitor races worth this much (all
   races still logged + counted).
 
@@ -229,6 +239,41 @@ def _same_block_live() -> bool:
     return MEMPOOL and MEMPOOL_LIVE and not MEMPOOL_SHADOW and not DRY_RUN and bool(CONTRACT)
 
 
+# --- oracle-push PREDICTION pre-arm layer (bot/pricefeed.py + bot/predict.py; ADDITIVE) ------
+# Chainlink BTC/ETH push on-chain ~30-40s AFTER the off-chain price (proxied by Binance spot)
+# crosses ~0.5% — the push lags by the OCR round+consensus+tx. Watching Binance and predicting
+# the push buys ~30-40s to be FULLY pre-armed (60-80x the mempool's ~0.6s head start), turning
+# same-block LOSSES on fast big moves into wins. This layer NEVER fires: prediction is a
+# PREPARATION edge, not an overtake (the position isn't liquidatable until the oracle reprices
+# on-chain, and the exact tip is still read from the pending oracle tx). It only PRE-ARMS —
+# widens the pre-signed flip-set for the moving feed's markets. SHADOW (default) measures only;
+# with KT_PREDICT unset the bot behaves EXACTLY as today (no threads, no polls, no arm change).
+PREDICT = os.environ.get("KT_PREDICT", "0") == "1"                    # master switch (default OFF)
+PREDICT_SHADOW = os.environ.get("KT_PREDICT_SHADOW", "1") != "0"      # default ON (measure only)
+PREDICT_LIVE = os.environ.get("KT_PREDICT_LIVE", "0") == "1"          # real pre-arm (never fires)
+PREDICT_ARM_PCT = float(os.environ.get("KT_PREDICT_ARM_PCT", "0.0045"))     # arm at |return| >=
+PREDICT_DISARM_PCT = float(os.environ.get("KT_PREDICT_DISARM_PCT", "0.0035"))  # retrace hysteresis
+PREDICT_FALSEPOS_WINDOW = float(os.environ.get("KT_PREDICT_FALSEPOS_WINDOW", "90"))  # stuck-FP (s)
+# When a feed is LIVE-pre-armed, widen the arm ceiling for ITS markets from KT_ARM_HF to this (a
+# ~0.5% oracle move can flip a position sitting up to ~this HF) and raise the arm cap so the
+# near-line targets are not evicted. Economics/sizing per target are IDENTICAL — only WHICH
+# targets we pre-sign changes (scheduling), and only while a feed is armed under KT_PREDICT_LIVE.
+PREDICT_ARM_HF = float(os.environ.get("KT_PREDICT_ARM_HF", "1.006"))
+PREDICT_ARM_MAX_N = int(os.environ.get("KT_PREDICT_ARM_MAX_N", "8"))
+PREDICT_POLL_SEC = float(os.environ.get("KT_PREDICT_POLL_SEC", "2.0"))   # aggregator latestRound
+PREDICT_INTERVAL_SEC = float(os.environ.get("KT_PREDICT_INTERVAL", "0.5"))   # driver step cadence
+PREDICT_WS_URL = os.environ.get("KT_PREDICT_WS_URL", "wss://stream.binance.com:9443/ws")
+PREDICT_SYMBOLS = tuple(s.strip().upper()
+                        for s in os.environ.get("KT_PREDICT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+                        if s.strip())
+
+
+def _predict_live() -> bool:
+    """Real pre-arm is gated: predict on, LIVE set, SHADOW off. Even LIVE never FIRES — it only
+    widens the pre-signed set; the fire still requires the mempool/fast-path on the real push."""
+    return PREDICT and PREDICT_LIVE and not PREDICT_SHADOW
+
+
 # fire-path tuning (review H7/H8): tight quote timeouts, bounded receipt wait, short success-
 # dedup so the REMAINDER of a chunked close is re-taken immediately instead of gifted for 5min.
 QUOTE_TIMEOUT = float(os.environ.get("KT_QUOTE_TIMEOUT", "5"))
@@ -253,6 +298,10 @@ LIQUIDATE_SELECTOR = selector(
     "liquidate((address,address,address,address,uint256),address,uint256,uint256,"
     "address,bytes,uint256)")
 SEL_ORACLE_PRICE = selector("price()")
+# prediction layer reads the Chainlink aggregators' latestRoundData DIRECTLY (not via multicall —
+# these access-controlled aggregators reject contract callers) to detect a push (updatedAt moves).
+SEL_LATEST_ROUND_DATA = selector("latestRoundData()")
+SEL_DECIMALS = selector("decimals()")
 _DEC = {v["address"].lower(): v["decimals"] for v in TOKENS.values()}
 # chunk fractions tried, largest-first — the largest whose net clears the floor wins.
 # RATIONALS, not floats: repaidShares on an 18-dec loan run ~1e27 (virtual-share scale 1e6),
@@ -936,13 +985,66 @@ def fire(rpc: Rpc, t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -
 # the perpetual near-edge dregs every idle window). Module-level: the loop is single-threaded.
 _arm: dict[str, dict] = {}
 
+# --- oracle-push PREDICTION pre-arm publish/consume (bot/predict.py drives this) -------------
+# The predict driver thread publishes the marketIds of the currently LIVE-pre-armed feeds here;
+# _arm_candidates reads a lock-guarded snapshot to widen the pre-signed net for those markets.
+# SHADOW/off never publishes -> the set stays empty -> _arm_candidates stays byte-identical.
+_predict_lock = threading.Lock()
+_predict_armed_markets: set[str] = set()   # marketId(lower) currently pre-armed by prediction
+
+
+def _predict_armed_snapshot() -> set[str]:
+    with _predict_lock:
+        return set(_predict_armed_markets)
+
+
+def _predict_on_arm(armed_symbols: set[str]) -> None:
+    """PredictDriver callback (driver thread): the armed Binance-symbol set changed. LIVE mode
+    republishes their markets so _arm_candidates widens; SHADOW/off publishes NOTHING (measure
+    only — zero effect on arm/fire state). NEVER signs or sends. Logs the prearm/prearm_clear
+    delta so the analyzer sees when the widened net opened/closed."""
+    global _predict_armed_markets
+    if not _predict_live():
+        return
+    from bot import predict as _pr
+    markets: set[str] = set()
+    for sym in armed_symbols:
+        markets |= _pr.markets_for_symbol(sym)
+    with _predict_lock:
+        prev = set(_predict_armed_markets)
+        _predict_armed_markets = markets
+    if markets == prev:
+        return
+    labels = sorted(_pr.FEED_LABEL[_pr.SYMBOL_FEED[s]]
+                    for s in armed_symbols if s in _pr.SYMBOL_FEED)
+    if markets:
+        pairs = sorted(oracles.market_pair(m) for m in markets)
+        print(_pr.format_line({"event": "prearm", "feed": ",".join(labels) or "-",
+                               "markets": ",".join(pairs), "n": len(markets)}))
+    else:
+        print(_pr.format_line({"event": "prearm_clear", "feed": "-"}))
+
 
 def _arm_candidates(rows: list[dict]) -> list[dict]:
     """Near-flip rows worth pre-arming: healthy but within KT_ARM_HF of the line, past the
-    same MIN_DEBT gate once() applies to targets, biggest debt first, capped at ARM_MAX_N."""
-    cand = [r for r in rows if 1.0 <= r["hf"] < ARM_HF
-            and (r["debt_usd"] is None or r["debt_usd"] >= MIN_DEBT_USD)]
-    return sorted(cand, key=lambda r: -(r.get("debt_usd") or 0))[:ARM_MAX_N]
+    same MIN_DEBT gate once() applies to targets, biggest debt first, capped at ARM_MAX_N.
+
+    When the PREDICTION layer has LIVE-pre-armed a feed (Binance says a ~0.5% oracle push is
+    imminent), the ceiling for THAT feed's markets widens to KT_PREDICT_ARM_HF and the cap to
+    KT_PREDICT_ARM_MAX_N — a wider pre-signed net so the reaction to the real push collapses to
+    insert-tip+broadcast. `pa` is empty unless _predict_live() published markets, so with
+    prediction off/shadow this is byte-identical to the classic behaviour."""
+    pa = _predict_armed_snapshot()
+    if pa:
+        cand = [r for r in rows
+                if 1.0 <= r["hf"] < (PREDICT_ARM_HF if r["market_id"].lower() in pa else ARM_HF)
+                and (r["debt_usd"] is None or r["debt_usd"] >= MIN_DEBT_USD)]
+        cap = max(ARM_MAX_N, PREDICT_ARM_MAX_N)
+    else:
+        cand = [r for r in rows if 1.0 <= r["hf"] < ARM_HF
+                and (r["debt_usd"] is None or r["debt_usd"] >= MIN_DEBT_USD)]
+        cap = ARM_MAX_N
+    return sorted(cand, key=lambda r: -(r.get("debt_usd") or 0))[:cap]
 
 
 def _arm_refresh(rpc: Rpc, rows: list[dict], st: dict, now_ts: float,
@@ -1560,6 +1662,19 @@ def _mempool_health_str() -> str:
             f"{'live' if _same_block_live() else 'shadow'})")
 
 
+_predict_feed_ref = None      # set by _start_predict; read for heartbeat telemetry
+_predict_driver_ref = None
+
+
+def _predict_health_str() -> str:
+    c = _predict_feed_ref
+    if c is None:
+        return ""
+    s = c.stats
+    return (f" predict={'up' if c.healthy() else 'DOWN'} "
+            f"(ticks {s['ticks']}, {'live' if _predict_live() else 'shadow'})")
+
+
 def heartbeat(st: dict) -> None:
     if HEARTBEAT_SEC <= 0:
         return
@@ -1570,7 +1685,7 @@ def heartbeat(st: dict) -> None:
     alert(f"💓 katana executor alive: passes {st['passes']}, fires {st['fires']}, "
           f"reverts {st['reverts']}, races lost {st.get('races_lost', 0)}, "
           f"gas today ${st['gas_usd']:.2f}/${MAX_DAILY_GAS_USD}. "
-          f"DRY_RUN={'on' if DRY_RUN else 'OFF'}.{_mempool_health_str()}")
+          f"DRY_RUN={'on' if DRY_RUN else 'OFF'}.{_mempool_health_str()}{_predict_health_str()}")
 
 
 _last_balance_check = 0.0
@@ -1698,6 +1813,70 @@ def _start_mempool(st: dict):
     return client
 
 
+def _predict_poll_pushes(rpc: Rpc) -> dict:
+    """Read each tracked feed's Chainlink aggregator latestRoundData DIRECTLY (from the zero
+    address — a contract-caller multicall is rejected by the aggregator's access control). Returns
+    {symbol: (updatedAt, price_float)}; a per-feed read failure just omits that symbol so the
+    driver skips it. Runs on the predict driver's OWN read lane (never the main loop's rpc)."""
+    from bot import predict as _pr
+    out: dict = {}
+    for sym in PREDICT_SYMBOLS:
+        feed = _pr.SYMBOL_FEED.get(sym)
+        agg = (oracles.FEEDS.get(feed) or {}).get("aggregator") if feed else None
+        if not agg:
+            continue
+        try:
+            dec = _predict_agg_decimals.get(agg)
+            if dec is None:
+                dec = int(rpc.eth_call(agg, SEL_DECIMALS), 16)
+                _predict_agg_decimals[agg] = dec
+            raw = bytes.fromhex(rpc.eth_call(agg, SEL_LATEST_ROUND_DATA)[2:])
+            answer = int.from_bytes(raw[32:64], "big", signed=True)   # word[1] = answer
+            updated_at = int.from_bytes(raw[96:128], "big")           # word[3] = updatedAt
+            if answer > 0:
+                out[sym] = (updated_at, answer / 10 ** dec)
+        except Exception:
+            continue
+    return out
+
+
+_predict_agg_decimals: dict[str, int] = {}
+
+
+def _start_predict(st: dict):
+    """Start the Binance pricefeed + prediction driver (daemon threads) if KT_PREDICT=1. Returns
+    (feed, driver) or None. NON-fatal on failure and NEVER fires — the fire path is untouched;
+    at worst we get no predictions. With KT_PREDICT unset this returns immediately (no threads)."""
+    if not PREDICT:
+        return None
+    try:
+        from bot.pricefeed import PriceFeed
+        from bot import predict as _pr
+        feed = PriceFeed(symbols=PREDICT_SYMBOLS, ws_url=PREDICT_WS_URL)
+        feed.start()
+        # dedicated read lane for the aggregator polls (own Rpc — never the main loop's lanes)
+        agg_rpc = Rpc(READ_RPCS or list(DEFAULT_RPCS), retries=1, min_interval=0.0,
+                      backoff_429=0.05, timeout=3.0)
+        engine = _pr.PredictEngine(PREDICT_SYMBOLS, arm_pct=PREDICT_ARM_PCT,
+                                   disarm_pct=PREDICT_DISARM_PCT,
+                                   falsepos_window=PREDICT_FALSEPOS_WINDOW)
+        driver = _pr.PredictDriver(engine, mid_fn=feed.mid,
+                                   poll_fn=lambda: _predict_poll_pushes(agg_rpc),
+                                   on_arm=_predict_on_arm, interval=PREDICT_INTERVAL_SEC,
+                                   poll_interval=PREDICT_POLL_SEC)
+        driver.start()
+    except Exception as e:
+        print(f"[predict] failed to start (fire path unaffected): {e}")
+        return None
+    mode = "LIVE pre-arm (never fires)" if _predict_live() else "SHADOW (measure only)"
+    print(f"[predict] oracle-push prediction layer started — {mode}; "
+          f"arm>={PREDICT_ARM_PCT * 100:.2f}% disarm<{PREDICT_DISARM_PCT * 100:.2f}% "
+          f"symbols={','.join(PREDICT_SYMBOLS)}")
+    global _predict_feed_ref, _predict_driver_ref
+    _predict_feed_ref, _predict_driver_ref = feed, driver
+    return feed, driver
+
+
 def loop() -> None:
     startup_preflight()
     st = load_state()
@@ -1728,6 +1907,7 @@ def loop() -> None:
                        backoff_429=0.05, timeout=3.0)
         clock = fastpath.BlockClock(read_rpc.poll_block_number)
     mempool_client = _start_mempool(st)
+    predict_client = _start_predict(st)   # Binance-predicted oracle-push pre-arm (SHADOW default)
     while True:
         try:
             # refresh the Morpho-indexer borrower set every API_REFRESH_SEC; between refreshes,

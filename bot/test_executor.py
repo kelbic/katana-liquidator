@@ -579,6 +579,63 @@ class TestArmCandidates(unittest.TestCase):
             ex.ARM_MAX_N = save
 
 
+class TestPredictPreArm(unittest.TestCase):
+    """The oracle-push prediction layer only ever WIDENS the pre-signed set for a live-pre-armed
+    feed's markets and NEVER fires. With prediction off/shadow, _arm_candidates is byte-identical
+    to the classic behaviour (empty published set)."""
+
+    def setUp(self):
+        self._save = (ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW)
+        with ex._predict_lock:
+            ex._predict_armed_markets = set()
+
+    def tearDown(self):
+        (ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW) = self._save
+        with ex._predict_lock:
+            ex._predict_armed_markets = set()
+
+    def _mid(self):
+        return _hot_row(1.005).get("market_id").lower()       # the market the rows belong to
+
+    def test_off_safe_identical_to_classic(self):
+        # nothing published -> HF 1.005 (above KT_ARM_HF 1.002) is NOT armed, exactly as today
+        rows = [_hot_row(1.005, 9000), _hot_row(1.0005, 2000)]
+        self.assertEqual([r["debt_usd"] for r in ex._arm_candidates(rows)], [2000])
+
+    def test_live_arm_widens_ceiling_for_its_markets(self):
+        with ex._predict_lock:
+            ex._predict_armed_markets = {self._mid()}          # BTC feed pre-armed
+        rows = [_hot_row(1.005, 9000),                         # now inside the widened ceiling
+                _hot_row(1.0005, 2000),
+                _hot_row(1.007, 5000)]                         # still outside KT_PREDICT_ARM_HF
+        got = [r["debt_usd"] for r in ex._arm_candidates(rows)]
+        self.assertEqual(got, [9000, 2000])                   # widened target now pre-armed
+
+    def test_on_arm_shadow_publishes_nothing(self):
+        ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW = True, False, True   # shadow (default)
+        ex._predict_on_arm({"BTCUSDT"})
+        self.assertEqual(ex._predict_armed_snapshot(), set())  # measure only — no side effect
+
+    def test_on_arm_live_publishes_markets(self):
+        from bot import predict as pr
+        ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW = True, True, False   # live pre-arm
+        ex._predict_on_arm({"BTCUSDT"})
+        self.assertEqual(ex._predict_armed_snapshot(), pr.markets_for_symbol("BTCUSDT"))
+        ex._predict_on_arm(set())                              # feed disarmed -> cleared
+        self.assertEqual(ex._predict_armed_snapshot(), set())
+
+    def test_pre_arm_never_broadcasts(self):
+        # publishing an armed feed + building arm candidates must never touch the write lane
+        ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW = True, True, False
+        save_w = ex._rpc_write
+        ex._rpc_write = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send"))
+        try:
+            ex._predict_on_arm({"BTCUSDT"})
+            ex._arm_candidates([_hot_row(1.005, 9000)])       # widened, but no signing/sending
+        finally:
+            ex._rpc_write = save_w
+
+
 class TestArmRefresh(unittest.TestCase):
     """Idle-zone arming: quotes/thresholds cached, blind-fire gating, sanity preflight."""
 
