@@ -36,7 +36,12 @@ Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFI
   KT_TRANSIENT_BACKOFF_SEC (2) — per-target retry backoff on write-RPC transport errors,
   KT_SEND_ERR_COOLDOWN_SEC (30) + KT_SEND_ERR_ALERT_SEC (600) / KT_SEND_ERR_ALERT_GLOBAL_SEC
   (60) — send-error target cooldown + alert throttles, KT_BALANCE_CHECK_SEC (600) /
-  KT_BALANCE_ALERT_SEC (3600) / KT_BALANCE_FIRES (3) — EOA gas-balance guard.
+  KT_BALANCE_ALERT_SEC (3600) / KT_BALANCE_FIRES (3) — EOA gas-balance guard,
+  KT_PREDICTIVE_POLL (1) — block-phase-locked detect + pre-armed fast fire (bot/fastpath.py),
+  KT_ARM_HF (1.002) / KT_ARM_MAX_N (4) / KT_ARM_QUOTE_TTL (2.5s) — pre-arm window,
+  KT_BLIND_FIRE (1) — skip preflight in the critical path at the default tip only,
+  KT_PREDICT_WINDOW (0.80) / KT_PREDICT_STEP (0.018) / KT_PREDICT_SLACK (0.75) /
+  KT_BLOCK_SEC (1.0) — boundary timing (bot/fastpath.py).
 
 Go-live preflight: `pip install -r requirements.txt` (eth_account for KT_RAW_TX=1) — the loop
 verifies deps/contract/chainId at startup and exits loudly if broken (never silently).
@@ -66,8 +71,10 @@ sys.path.insert(0, REPO)
 from analysis.keccak import selector                                   # noqa: E402
 from analysis.models import lif_from_lltv                              # noqa: E402
 from analysis.monitor import scan, load_state as load_monitor_state    # noqa: E402
+from analysis.multicall import MULTICALL3                              # noqa: E402
 from analysis.protocols import MORPHO, STABLES, TOKENS                 # noqa: E402
 from analysis.rpc import DEFAULT_RPCS, Rpc                             # noqa: E402
+from bot import fastpath                                               # noqa: E402
 from bot.sushi import quote, NoRouteError, SWAP_INPUT_HAIRCUT         # noqa: E402
 
 # --- config -------------------------------------------------------------------
@@ -152,6 +159,27 @@ CHECKPOINT_BLOCK = os.environ.get("KT_CHECKPOINT_BLOCK")
 # ETH/USD seed for gas math AND the non-stable (vbETH-loan) profit floor; refreshed from a live
 # Sushi quote every ~5min by the loop (review H1) — the env value is only the cold-start seed.
 ETH_USD = float(os.environ.get("KT_ETH_USD", "3300"))
+
+# --- v3 latency upgrade: predictive block-boundary detect + pre-armed fire fast path ---
+# MEASURED (probe harness ~/.katana-probe, 551 probes, 2026-07-16/17): a tx lands in the NEXT
+# block only if it ARRIVES at the sequencer within ~0.25-0.35s of block N becoming visible —
+# P(next) 21% at submit-offset +0.05s, 9-13% at +0.15-0.25s, ~0% at >=0.35s; send one-way
+# ~110-150ms. The classic detect (fixed cadence + cold sockets, 0.65-1.05s) forfeited that
+# window before even evaluating (end-to-end 1.5-2.1s -> P(B0+1) ~7-10%). Predictive mode
+# (bot/fastpath.py) phase-locks the ~1.000s tick, does ALL maintenance (hot pass, Sushi
+# re-quotes, preflight, pre-sign, warm-up pings) in the idle zone, and on boundary detect
+# runs only: ONE pre-built multicall price read -> integer flip-threshold compare ->
+# pre-signed eth_sendRawTransaction. Critical path ~ step/2 + 2 warm RTT (~60-110ms).
+PREDICTIVE_POLL = os.environ.get("KT_PREDICTIVE_POLL", "1") == "1"
+ARM_HF = float(os.environ.get("KT_ARM_HF", "1.002"))   # pre-arm 1 <= HF < this (near-flip)
+ARM_MAX_N = int(os.environ.get("KT_ARM_MAX_N", "4"))   # biggest tickets first
+ARM_QUOTE_TTL = float(os.environ.get("KT_ARM_QUOTE_TTL", "2.5"))  # armed quote/sig freshness
+# Blind fire = skip quote+preflight inside the critical path (both ran at arm time). Safe at
+# the default 0.001 gwei tip: a lost race reverts on-chain for ~$0.001. With a Phase-2 fee
+# bid a reverted tx burns the BID, so any target the bidder would escalate keeps the free
+# preflight eth_call (~1 warm RTT) in its critical path. KT_BLIND_FIRE=0 forces preflight
+# for every fast fire.
+BLIND_FIRE = os.environ.get("KT_BLIND_FIRE", "1") == "1"
 
 # fire-path tuning (review H7/H8): tight quote timeouts, bounded receipt wait, short success-
 # dedup so the REMAINDER of a chunked close is re-taken immediately instead of gifted for 5min.
@@ -312,10 +340,12 @@ def refresh_eth_usd() -> None:
 
 
 # --- evaluate: size the exit against a live Sushi quote (chunking) ------------
-def evaluate(rpc: Rpc, t: dict, gas_usd: float) -> dict | None:
+def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = None) -> dict | None:
     """Quote the exit for target `t` (a monitor scan row), chunking down until the net clears
     KT_MIN_PROFIT_USD. Returns fire params (repaidShares, swapTarget, swapCalldata, minProfit)
-    or None if no chunk is profitable. All chunk sizing is EXACT integer math (review C1)."""
+    or None if no chunk is profitable. All chunk sizing is EXACT integer math (review C1).
+    `deadline_mono` (optional) caps the internal deadline — the pre-arm path runs this inside
+    the idle zone and must never let a slow Sushi chain overrun the armed window."""
     loan, coll = t["loan"], t["coll"]
     loan_dec = token_decimals(rpc, loan)
     lif = lif_from_lltv(t["lltv"])
@@ -334,7 +364,14 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float) -> dict | None:
 
     best = None
     deadline = time.monotonic() + EVAL_DEADLINE_SEC
+    if deadline_mono is not None:
+        deadline = min(deadline, deadline_mono)
     for num, den in CHUNK_FRACTIONS:
+        if time.monotonic() > deadline:
+            # checked BEFORE each quote: a spent budget must never start another network
+            # round-trip (the post-failure checks below only cover the failure paths)
+            print("    evaluate deadline exceeded")
+            break
         seized = seized_full * num // den
         if seized <= 0:
             continue
@@ -486,6 +523,16 @@ def _rpc_write(method: str, params: list, timeout: float = 15.0):
     return d["result"]
 
 
+def _warm_write() -> None:
+    """Keep the write lane's socket open with a cheap eth_chainId (~1 warm RTT): the LB idle
+    timeout (~60s) would otherwise leave eth_sendRawTransaction paying TCP+TLS exactly when a
+    target flips. Called every hot pass and before each armed window. Never raises."""
+    try:
+        _rpc_write("eth_chainId", [])
+    except Exception:
+        pass
+
+
 _owner_addr_cache: str | None = None
 
 
@@ -607,6 +654,19 @@ def _record_send_error(st: dict, key: str, now_ts: float, gas_usd: float, e, wha
         del seen[k]
 
 
+def _sign_liquidate(nonce: int, max_fee: int, priority: int, calldata: str) -> str:
+    """EIP-1559 sign of the liquidate tx -> raw 0x-hex. Shared by the classic path (signs at
+    send time) and the pre-arm path (signs in the idle window; the signature freezes nonce +
+    fee, which is why armed entries are invalidated whenever another fire happens)."""
+    from eth_account import Account
+    tx = {"chainId": CHAIN_ID, "nonce": nonce, "to": _cs(CONTRACT), "value": 0,
+          "gas": GAS_LIMIT, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority,
+          "data": calldata}
+    signed = Account.sign_transaction(tx, PRIVATE_KEY)     # key never logged
+    raw = signed.raw_transaction
+    return raw.to_0x_hex() if hasattr(raw, "to_0x_hex") else "0x" + raw.hex()
+
+
 def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: str,
               gas_usd: float, priority_gwei: float | None = None) -> None:
     from eth_account import Account
@@ -614,19 +674,20 @@ def _fire_raw(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: st
         addr = Account.from_key(PRIVATE_KEY).address
         max_fee, priority = _fee_params(priority_gwei)
         nonce = int(_rpc_write("eth_getTransactionCount", [addr, "pending"]), 16)
-        tx = {"chainId": CHAIN_ID, "nonce": nonce, "to": _cs(CONTRACT), "value": 0,
-              "gas": GAS_LIMIT, "maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority,
-              "data": calldata}
-        signed = Account.sign_transaction(tx, PRIVATE_KEY)     # key never logged
-        raw = signed.raw_transaction
-        raw_hex = raw.to_0x_hex() if hasattr(raw, "to_0x_hex") else "0x" + raw.hex()
+        raw_hex = _sign_liquidate(nonce, max_fee, priority, calldata)
         txh = _rpc_write("eth_sendRawTransaction", [raw_hex])
     except Exception as e:
         # transport/signing failure BEFORE broadcast is NOT a revert (review M10): refund the
         # gas estimate, don't feed the kill-switch; cooldown + throttled alert.
         _record_send_error(st, key, now_ts, gas_usd, e, "send")
         return
-    # alert strictly AFTER broadcast, fire-and-forget (review H2)
+    _post_broadcast(t, ev, st, now_ts, key, calldata, gas_usd, txh)
+
+
+def _post_broadcast(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: str,
+                    gas_usd: float, txh: str) -> None:
+    """Post-send tracking shared by the classic and pre-armed fast paths: alert strictly
+    AFTER broadcast (review H2), bounded receipt wait, settle — or track as pending (H7)."""
     alert(f"🔫 sent {txh} HF={t['hf']:.4f} chunk={ev['f']:.0%} {t['borrower'][:10]}…")
     rcpt, deadline = None, time.time() + RECEIPT_WAIT_SEC
     while time.time() < deadline:
@@ -766,6 +827,208 @@ def fire(rpc: Rpc, t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -
         _fire_cast(t, ev, st, now_ts, key, calldata, fire_gas_usd, bid_gwei)
 
 
+# --- pre-armed fire fast path (KT_PREDICTIVE_POLL; see fastpath docstring) ------
+# key -> armed entry {t, ev, key, calldata, raw, blind, bid_gwei, gas_usd, ts (monotonic),
+# fires_at_sign} or {skip_until} for targets evaluate() declined at arm time (don't re-quote
+# the perpetual near-edge dregs every idle window). Module-level: the loop is single-threaded.
+_arm: dict[str, dict] = {}
+
+
+def _arm_candidates(rows: list[dict]) -> list[dict]:
+    """Near-flip rows worth pre-arming: healthy but within KT_ARM_HF of the line, past the
+    same MIN_DEBT gate once() applies to targets, biggest debt first, capped at ARM_MAX_N."""
+    cand = [r for r in rows if 1.0 <= r["hf"] < ARM_HF
+            and (r["debt_usd"] is None or r["debt_usd"] >= MIN_DEBT_USD)]
+    return sorted(cand, key=lambda r: -(r.get("debt_usd") or 0))[:ARM_MAX_N]
+
+
+def _arm_refresh(rpc: Rpc, rows: list[dict], st: dict, now_ts: float,
+                 deadline_mono: float) -> None:
+    """Idle-zone maintenance: (re)build pre-armed fire entries for near-flip targets.
+    Everything the classic path does between detect and broadcast — live shares, the Sushi-
+    quoted sizing (evaluate(): IDENTICAL floors/chunk math, economics unchanged), calldata,
+    a sanity preflight, fee params, nonce, signature — happens HERE under a time budget, so
+    a flip's critical path is just: threshold compare (µs) + eth_sendRawTransaction.
+    Entries go stale after ARM_QUOTE_TTL — a fast fire must never use an old quote."""
+    mono = time.monotonic()
+    cands = _arm_candidates(rows)
+    keep = {f"{r['market_id']}:{r['borrower']}" for r in cands}
+    for k in list(_arm):    # prune cured/out-of-set entries (keep unexpired skip records)
+        if k not in keep and _arm[k].get("skip_until", 0) <= now_ts:
+            del _arm[k]
+    gas_usd = None
+    for t in cands:
+        key = f"{t['market_id']}:{t['borrower']}"
+        e = _arm.get(key)
+        if e and e.get("skip_until", 0) > now_ts:
+            continue
+        if e and e.get("ev") and mono - e["ts"] < ARM_QUOTE_TTL * 0.5:
+            continue        # fresh enough — don't burn idle budget re-quoting
+        if time.monotonic() > deadline_mono - 0.30:
+            break           # a quote round needs ~0.3s headroom — never START one that will
+            #                 overrun the armed window (a started quote can't be cancelled)
+        if recently_fired(st, key, now_ts) or recently_declined(st, key, now_ts):
+            continue
+        t = dict(t)         # never mutate the caller's scan rows
+        try:
+            t["borrow_shares_repaid"] = (0 if t["repaid_assets"] < t["debt_assets"]
+                                         else _shares_for_repaid(rpc, t))
+            if gas_usd is None:
+                gas_usd = gas_cost_usd(rpc)
+            ev = evaluate(rpc, t, gas_usd, deadline_mono=deadline_mono)
+        except Exception as err:
+            print(f"  arm {t['borrower'][:10]}…: {str(err)[:120]}")
+            continue
+        if not ev:
+            if time.monotonic() > deadline_mono:
+                continue    # the idle BUDGET stopped it, not economics — retry next window
+            # same verdict evaluate() gives flipped targets (no profitable chunk/no route).
+            # NOT st['declined'] — the target hasn't flipped; a local skip TTL instead.
+            _arm[key] = {"skip_until": now_ts + DECLINE_TTL}
+            continue
+        bid_gwei = _competitive_priority_gwei(ev["net_usd"])
+        entry = {"t": t, "ev": ev, "key": key, "calldata": liquidate_calldata(t, ev),
+                 "ts": time.monotonic(), "raw": None, "bid_gwei": bid_gwei,
+                 "blind": BLIND_FIRE and bid_gwei <= PRIORITY_GWEI,
+                 "gas_usd": (GAS_UNITS_EST * bid_gwei / 1e9 * ETH_USD
+                             if bid_gwei > PRIORITY_GWEI else gas_usd)}
+        if not DRY_RUN and CONTRACT and PRIVATE_KEY:
+            try:
+                pf_ok, why = _preflight_call(entry["calldata"])
+            except RpcTransportError as err:
+                pf_ok, why = None, str(err)   # unknown — arm, but keep preflight in the path
+            if pf_ok:
+                # already liquidatable (crossed between scan and now): fire the classic path
+                # right here — it re-checks the oracle and preflights again itself
+                ok, reason = guard_ok(st)
+                if not ok:
+                    raise GuardTripped(reason)
+                print(f"  arm: {t['borrower'][:10]}… already flipped — classic fire now")
+                fire(rpc, t, ev, st, now_ts, gas_usd)
+                continue
+            if pf_ok is False and "healthy" not in why.lower():
+                # the arm-time preflight of a not-yet-flipped target MUST revert 'position
+                # is healthy' — that proves calldata/route reach Morpho intact. Any OTHER
+                # revert (SwapFailed, Panic on current state, ...) = do NOT arm this build.
+                print(f"  arm: unexpected preflight revert (not armed): {why[:120]}")
+                _arm[key] = {"skip_until": now_ts + TRANSIENT_BACKOFF_SEC}
+                continue
+            if pf_ok is None:
+                entry["blind"] = False        # transport blinded the sanity check
+            try:
+                from eth_account import Account
+                addr = Account.from_key(PRIVATE_KEY).address
+                max_fee, priority = _fee_params(entry["bid_gwei"])
+                nonce = int(_rpc_write("eth_getTransactionCount", [addr, "pending"]), 16)
+                entry["raw"] = _sign_liquidate(nonce, max_fee, priority, entry["calldata"])
+                entry["fires_at_sign"] = st.get("fires", 0)
+            except Exception as err:
+                print(f"  arm sign failed (classic path covers): {str(err)[:120]}")
+                continue
+        _arm[key] = entry
+
+
+def _fire_fast(entry: dict, st: dict, now_ts: float) -> bool:
+    """Armed-window critical path for a flipped pre-armed target. Blind entries (default
+    tip) go straight to eth_sendRawTransaction on the warm write lane — zero further RPC; a
+    lost race reverts on-chain for ~$0.001. Bid entries keep the free preflight eth_call
+    (~1 warm RTT): a reverted bid burns the bid. The classic path's oracle re-read (M3) is
+    unnecessary here: this window fired BECAUSE of a price read this instant, and for the
+    shares-mode closes armed entries always are, net is price-insensitive (repaid + swap
+    amountIn are frozen in calldata; a lower exec price only seizes MORE collateral, surplus
+    swept as dust) with the on-chain minProfit floor as the final guarantee.
+    Returns True iff a broadcast happened (the caller then defers to the classic pass for
+    settle/remainder). Never records send_error cooldowns — on any miss the classic pass
+    retries with fresh nonce/fees within ~1s."""
+    key, t, ev = entry["key"], entry["t"], entry["ev"]
+    ok, reason = guard_ok(st)
+    if not ok:
+        raise GuardTripped(reason)
+    if recently_fired(st, key, now_ts) or recently_declined(st, key, now_ts):
+        return False
+    if time.monotonic() - entry.get("ts", 0) > ARM_QUOTE_TTL:
+        return False                      # stale quote/signature — classic pass takes it
+    if DRY_RUN or not CONTRACT or not entry.get("raw"):
+        nets = (f"${ev['net_usd']:+,.1f}" if ev["net_usd"] is not None
+                else f"{ev['net_wei']}wei")
+        print(f"  ⚡ fast-path flip {t['borrower'][:10]}… HF was {t['hf']:.4f} net={nets} "
+              f"({'DRY_RUN' if DRY_RUN else 'unsigned'}; classic pass takes it)")
+        return False
+    if entry.get("fires_at_sign") != st.get("fires", 0):
+        return False                      # a fire happened since signing: nonce is burned
+    if not entry["blind"]:
+        try:
+            pf_ok, why = _preflight_call(entry["calldata"])
+        except RpcTransportError as e:
+            st["declined"][key] = {"ts": now_ts, "ttl": TRANSIENT_BACKOFF_SEC}
+            print(f"  fast preflight transport (backoff, NOT declined): {str(e)[:120]}")
+            return False
+        if not pf_ok:
+            if _is_lost_race(why):
+                st["races_lost"] = st.get("races_lost", 0) + 1
+                alert(f"🏁 fast preflight: lost race {t['borrower'][:10]}… ({why[:100]})")
+            else:
+                print(f"  fast preflight revert (NOT sent, zero gas): {why[:160]}")
+            st["declined"][key] = {"ts": now_ts}
+            return False
+    st["fires"] += 1
+    st["gas_usd"] += entry["gas_usd"]
+    try:
+        txh = _rpc_write("eth_sendRawTransaction", [entry["raw"]])
+    except Exception as e:
+        st["fires"] -= 1                  # refund — the classic pass takes over untainted
+        st["gas_usd"] -= entry["gas_usd"]
+        entry["raw"] = None
+        print(f"  fast send failed (classic path takes over): {str(e)[:160]}")
+        return False
+    entry["raw"] = None                   # nonce consumed — never reusable
+    _post_broadcast(t, ev, st, now_ts, key, entry["calldata"], entry["gas_usd"], txh)
+    return True
+
+
+def _predictive_cycle(read_rpc: Rpc, clock: "fastpath.BlockClock", rows: list[dict],
+                      st: dict) -> bool:
+    """One block-locked cycle around the hot pass: sync if needed -> idle-zone maintenance
+    (arm refresh, warm-up pings, pre-built price calldata) -> boundary tight-poll -> ONE
+    multicall price refresh -> flip-threshold compare -> pre-armed fire. Returns True when
+    the boundary wait consumed this iteration's sleep (the loop runs the next hot pass
+    immediately — that pass is the safety net for flips without an armed entry); False when
+    the phase lock failed and the caller should fall back to the classic HOT_POLL cadence."""
+    if not clock.synced and clock.sync() is None:
+        return False                      # tight lane not answering — classic cadence
+    now_ts = time.time()
+    budget = time.monotonic() + max(0.0, clock.idle_remaining() - 0.15)
+    _arm_refresh(read_rpc, rows, st, now_ts, budget)
+    watch = fastpath.attach_flip_thresholds(rows)
+    calldata, oracles = fastpath.build_price_refresh(watch) if watch else ("", [])
+    read_rpc.warm()
+    _warm_write()
+    if clock.wait_next() is None:
+        # soft break (still synced: late entry absorbed by a predicted anchor) -> True, the
+        # loop runs the hot pass immediately and stays block-locked; hard break -> False,
+        # fall back to the classic cadence and re-sync next cycle.
+        return clock.synced
+    if not watch:
+        return True                       # block-locked cadence, nothing near the line
+    try:
+        ret = read_rpc.eth_call(MULTICALL3, calldata, gas=30_000_000)
+        prices = fastpath.decode_price_refresh(ret, oracles)
+    except Exception as e:
+        print(f"  armed price refresh failed: {str(e)[:120]}")
+        return True
+    fired = False
+    for row in fastpath.flipped(watch, prices):
+        key = f"{row['market_id']}:{row['borrower']}"
+        entry = _arm.get(key)
+        if entry and entry.get("ev"):
+            fired = _fire_fast(entry, st, time.time()) or fired
+        else:
+            print(f"  flip w/o armed entry {row['borrower'][:10]}… — classic pass takes it")
+    if fired:
+        save_state(st)
+    return True
+
+
 # --- guards --------------------------------------------------------------------
 class GuardTripped(Exception):
     pass
@@ -820,8 +1083,10 @@ def _seed_monitor_state() -> dict:
     return ms
 
 
-def once(st: dict | None = None, mstate: dict | None = None, skip_api: bool = False) -> tuple[int, int]:
-    """One pass. Returns (n_targets HF<1, n_near_edge HF<report_hf). skip_api=True re-reads the
+def once(st: dict | None = None, mstate: dict | None = None,
+         skip_api: bool = False) -> tuple[int, int, list[dict]]:
+    """One pass. Returns (n_targets HF<1, n_hot HF<HOT_HF, hot_rows) — hot_rows feed the
+    predictive fast path (flip thresholds + arm candidates). skip_api=True re-reads the
     cached borrower set's HF on-chain without a Morpho-indexer call (hot-poll)."""
     own = st is None
     if own:
@@ -909,8 +1174,8 @@ def once(st: dict | None = None, mstate: dict | None = None, skip_api: bool = Fa
     if own:
         save_state(st)
     # imminent = any position (target or near-edge) within HOT_HF of the liquidation line -> hot-poll
-    n_hot = sum(1 for x in r["targets"] + r["risk"] if x["hf"] < HOT_HF)
-    return len(r["targets"]), n_hot
+    hot_rows = [x for x in r["targets"] + r["risk"] if x["hf"] < HOT_HF]
+    return len(r["targets"]), len(hot_rows), hot_rows
 
 
 _SEL_POSITION = selector("position(bytes32,address)")
@@ -1036,6 +1301,17 @@ def startup_preflight() -> None:
         sys.exit(1)
 
 
+def _kill(st: dict, g: Exception) -> None:
+    msg = (f"🛑 KILL-SWITCH: {g}. Executor stopped — needs intervention "
+           f"(python3 -m bot.executor reset, then restart).")
+    print(msg)
+    if time.time() - st.get("last_kill_alert", 0) > 900:   # cron restarts each minute
+        st["last_kill_alert"] = time.time()
+        alert(msg, sync=True)
+    save_state(st)
+    sys.exit(1)   # non-zero: a supervisor must see this as FAILURE, not exit 0 (C4)
+
+
 def loop() -> None:
     startup_preflight()
     st = load_state()
@@ -1043,6 +1319,7 @@ def loop() -> None:
     banner = (f"▶️ katana executor started (DRY_RUN={'on' if DRY_RUN else 'OFF'}, "
               f"min_profit ${MIN_PROFIT_USD}, contract={'set' if CONTRACT else 'NONE'}, "
               f"hot-poll {HOT_POLL_SEC}s<HF{HOT_HF}/API {API_REFRESH_SEC}s/idle {POLL_SEC}s, "
+              f"predictive={'on' if PREDICTIVE_POLL else 'off'}, "
               f"kill-switch: gas ${MAX_DAILY_GAS_USD}/day, {MAX_CONSEC_REVERTS} reverts).")
     print(banner)
     # the cron watchdog resurrects this process every minute — throttle repeat banners so a
@@ -1056,29 +1333,43 @@ def loop() -> None:
     n_hot = 0   # preserved across passes: an exception in once() must NOT drop a hot cascade
     #             to the idle POLL_SEC cadence — keep the last known hot count until a pass
     #             completes (resetting it per-iteration slept 20s with positions at the edge)
+    hot_rows: list[dict] = []   # same rationale: keep the last known hot set on a bad pass
+    clock = read_rpc = None
+    if PREDICTIVE_POLL:
+        # dedicated keep-alive read lane for the boundary tight-poll + armed price refresh:
+        # snappy (no pacing, short timeout/429 backoff — the next block is the retry)
+        read_rpc = Rpc(READ_RPCS or list(DEFAULT_RPCS), retries=2, min_interval=0.0,
+                       backoff_429=0.05, timeout=3.0)
+        clock = fastpath.BlockClock(read_rpc.poll_block_number)
     while True:
         try:
             # refresh the Morpho-indexer borrower set every API_REFRESH_SEC; between refreshes,
             # re-read the cached set's HF on-chain (skip_api) so we can hot-poll cheaply.
             do_api = (time.time() - last_api) >= API_REFRESH_SEC
-            _, n_hot = once(st, mstate, skip_api=not do_api)
+            _, n_hot, hot_rows = once(st, mstate, skip_api=not do_api)
             if do_api:
                 last_api = time.time()
         except GuardTripped as g:
-            msg = (f"🛑 KILL-SWITCH: {g}. Executor stopped — needs intervention "
-                   f"(python3 -m bot.executor reset, then restart).")
-            print(msg)
-            if time.time() - st.get("last_kill_alert", 0) > 900:   # cron restarts each minute
-                st["last_kill_alert"] = time.time()
-                alert(msg, sync=True)
-            save_state(st)
-            sys.exit(1)   # non-zero: a supervisor must see this as FAILURE, not exit 0 (C4)
+            _kill(st, g)
         except Exception as e:
             print(f"loop err: {e}")
         heartbeat(st)
         if not DRY_RUN:
             check_balance(st, time.time())   # periodic EOA gas guard (throttled internally)
         save_state(st)
+        if n_hot > 0 and clock is not None:
+            # predictive mode: the block-boundary wait REPLACES the hot sleep — maintenance
+            # runs in the idle zone, the armed window fires pre-signed on a flip, and the
+            # next hot pass (immediately after) is the safety net / remainder-taker.
+            try:
+                if _predictive_cycle(read_rpc, clock, hot_rows, st):
+                    continue
+            except GuardTripped as g:
+                _kill(st, g)
+            except Exception as e:
+                print(f"predictive err (falling back to hot cadence): {e}")
+        elif n_hot > 0:
+            _warm_write()   # classic hot cadence still keeps the fire lane warm
         # hot cadence when a position is within HOT_HF of liquidation, else idle cadence
         time.sleep(HOT_POLL_SEC if n_hot > 0 else POLL_SEC)
 

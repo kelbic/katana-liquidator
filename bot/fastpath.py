@@ -119,6 +119,7 @@ class BlockClock:
         self._now, self._sleep = now, sleep
         self.block: int | None = None   # last block seen
         self.t0: float | None = None    # monotonic instant its transition was DETECTED
+        self._predicted = 0             # consecutive predicted (unobserved) anchors
 
     @property
     def synced(self) -> bool:
@@ -146,6 +147,7 @@ class BlockClock:
                     base = bn
                 elif bn > base:
                     self.block, self.t0 = bn, t
+                    self._predicted = 0
                     return bn, t
             self._sleep(coarse)
         self.t0 = None
@@ -154,7 +156,9 @@ class BlockClock:
     def wait_next(self) -> tuple[int, float] | None:
         """Block-boundary wait: sleep until t0+WINDOW, then tight-poll every STEP until the
         next block appears. Returns (block, t_detect) — t_detect ≈ first RPC visibility —
-        and re-anchors the phase on it. None (phase invalidated) when the pattern broke."""
+        and re-anchors the phase on it. None = no fireable detect; check `synced` after:
+        True means a late armed-zone entry was absorbed by a predicted anchor (stay block-
+        locked), False means the pattern broke and a re-sync is required."""
         if self.block is None or self.t0 is None:
             return None
         target = self.t0 + self.window
@@ -174,10 +178,21 @@ class BlockClock:
                 self.block = bn
                 if saw_old and jumped == 1:
                     self.t0 = t          # boundary within (prev poll, now] — tight anchor
+                    self._predicted = 0
                     return bn, t
-                # first armed poll was already new, or we skipped a block: the boundary
-                # instant is unknown — anchoring now would be late by up to WINDOW and the
-                # error would compound. Re-sync instead.
+                if jumped == 1 and self._predicted < 2:
+                    # entered the armed zone LATE (a slow pass ate past the boundary): the
+                    # boundary instant wasn't observed, but the cadence is ~1.000s — predict
+                    # the anchor one period on instead of paying a full ~1-block re-sync.
+                    # No detect is returned (too late to fire into this block); `synced`
+                    # stays True so the caller keeps the block-locked cadence. Never chain
+                    # more than 2 predictions without an OBSERVED boundary.
+                    predicted = self.t0 + self.block_sec
+                    if 0.0 <= t - predicted <= self.block_sec:
+                        self._predicted += 1
+                        self.t0 = predicted
+                        return None
+                # skipped block / stale phase: the boundary time is unknowable — re-sync
                 self.t0 = None
                 return None
             if bn is not None:

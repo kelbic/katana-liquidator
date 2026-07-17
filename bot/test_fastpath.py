@@ -208,13 +208,41 @@ class TestBlockClock(unittest.TestCase):
         self.assertIsNone(c.wait_next())
         self.assertFalse(c.synced)
 
-    def test_first_poll_already_new_resyncs_instead_of_late_anchor(self):
+    def test_bad_anchor_resyncs_instead_of_guessing(self):
         ch = _FakeChain()
         c = _clock(ch)
         c.sync()
-        c.t0 += 0.5                                          # simulate a badly late anchor:
-        self.assertIsNone(c.wait_next())                     # first armed poll sees N+1
-        self.assertFalse(c.synced)                           # -> refuse to guess the boundary
+        c.t0 += 0.5                                          # corrupt anchor: prediction from
+        self.assertIsNone(c.wait_next())                     # it would land in the future ->
+        self.assertFalse(c.synced)                           # refuse to guess the boundary
+
+    def test_late_entry_predicts_anchor_and_stays_locked(self):
+        # a slow pass ate past the boundary: no fireable detect, but the ~1.000s cadence
+        # lets the clock predict the anchor — no ~1-block re-sync cost
+        ch = _FakeChain()
+        c = _clock(ch)
+        c.sync()
+        t0 = c.t0
+        ch.t = t0 + 1.1                                      # enter after the next boundary
+        self.assertIsNone(c.wait_next())                     # too late to fire this block...
+        self.assertTrue(c.synced)                            # ...but still block-locked
+        self.assertAlmostEqual(c.t0, t0 + c.block_sec)       # predicted anchor
+        got = c.wait_next()                                  # next cycle detects normally
+        self.assertIsNotNone(got)
+        boundary = ch.b0 + 2 * ch.dt
+        self.assertLessEqual(got[1] - boundary, c.step + 2 * ch.rtt)
+
+    def test_predicted_anchors_never_chain_past_two(self):
+        ch = _FakeChain()
+        c = _clock(ch)
+        c.sync()
+        for i in range(2):                                   # two late entries absorbed
+            ch.t = c.t0 + 1.1
+            self.assertIsNone(c.wait_next())
+            self.assertTrue(c.synced, f"lost lock on predicted anchor {i}")
+        ch.t = c.t0 + 1.1                                    # third in a row: no observed
+        self.assertIsNone(c.wait_next())                     # boundary for 3 blocks — the
+        self.assertFalse(c.synced)                           # phase is guesswork, re-sync
 
     def test_skipped_block_resyncs(self):
         ch = _FakeChain()

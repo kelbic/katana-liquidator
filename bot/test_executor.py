@@ -2,6 +2,7 @@
 so chunk selection, the profit gate, and calldata encoding are tested deterministically."""
 import json
 import os
+import time
 import unittest
 import urllib.parse
 
@@ -472,6 +473,423 @@ class TestBalanceCheck(unittest.TestCase):
         ex._owner_addr_cache = ""                            # no derivable EOA -> skip silently
         self.assertTrue(ex.check_balance({}, 1e9, force=True))
         self.assertEqual(self.alerts, [])
+
+
+class _ArmRpc:
+    """Read-RPC stub for the arm path: position() read for live shares + gas price."""
+    def __init__(self, borrow_shares=int(61000e6 * 1000)):
+        self._pos = "0x" + "0" * 64 + f"{borrow_shares:064x}" + f"{int(1e8):064x}"
+
+    def eth_call(self, to, data, tag="latest", gas=None):
+        return self._pos
+
+    def gas_price(self):
+        return int(0.001e9)
+
+
+def _hot_row(hf=1.0005, debt_usd=61000.0):
+    t = _target(1.0, 61000.0)
+    t["hf"] = hf
+    t["debt_usd"] = debt_usd
+    t["collateral"] = int(1.2e8)     # 1.2 vbWBTC backing the ~1 BTC full-close seize
+    return t
+
+
+class TestArmCandidates(unittest.TestCase):
+    def test_window_gate_and_order(self):
+        rows = [_hot_row(0.998, 9000),      # already flipped — classic path's job
+                _hot_row(1.0005, 2000), _hot_row(1.0015, 8000),
+                _hot_row(1.0019, None),     # unknown USD — still watched (like once())
+                _hot_row(1.0005, 100),      # below MIN_DEBT gate
+                _hot_row(1.01, 50000)]      # outside KT_ARM_HF
+        cands = ex._arm_candidates(rows)
+        self.assertEqual([r["debt_usd"] for r in cands], [8000, 2000, None])
+
+    def test_cap_biggest_first(self):
+        save = ex.ARM_MAX_N
+        ex.ARM_MAX_N = 2
+        try:
+            rows = [_hot_row(1.001, d) for d in (1000, 3000, 2000)]
+            self.assertEqual([r["debt_usd"] for r in ex._arm_candidates(rows)], [3000, 2000])
+        finally:
+            ex.ARM_MAX_N = save
+
+
+class TestArmRefresh(unittest.TestCase):
+    """Idle-zone arming: quotes/thresholds cached, blind-fire gating, sanity preflight."""
+
+    def setUp(self):
+        self._save = (ex.DRY_RUN, ex.quote, ex.FEE_BID, ex.BLIND_FIRE, ex.PRIVATE_KEY,
+                      ex._preflight_call, ex._rpc_write, ex.alert, ex.fire)
+        ex._arm.clear()
+        ex.DRY_RUN = True
+        ex.BLIND_FIRE = True
+        ex.FEE_BID = False
+        ex.quote = _stub_quote(out_per_btc=61500, impact=0.008)
+        ex.alert = lambda text, sync=False: None
+
+    def tearDown(self):
+        (ex.DRY_RUN, ex.quote, ex.FEE_BID, ex.BLIND_FIRE, ex.PRIVATE_KEY,
+         ex._preflight_call, ex._rpc_write, ex.alert, ex.fire) = self._save
+        ex._arm.clear()
+
+    def _st(self):
+        return {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0,
+                "consec_reverts": 0, "reverts": 0}
+
+    def test_dry_run_arms_quote_without_signing(self):
+        row = _hot_row()
+        ex._arm_refresh(_ArmRpc(), [row], self._st(), 1000.0, time.monotonic() + 5)
+        key = f"{row['market_id']}:{row['borrower']}"
+        e = ex._arm[key]
+        self.assertIsNotNone(e["ev"])
+        self.assertTrue(e["calldata"].startswith("0x79755efe"))
+        self.assertIsNone(e["raw"])                       # DRY_RUN: nothing signed
+        self.assertTrue(e["blind"])                       # default tip -> blind allowed
+        self.assertEqual(e["ev"]["repaid_shares"], int(61000e6 * 1000))  # LIVE shares used
+
+    def test_unprofitable_candidate_skipped_with_ttl(self):
+        ex.quote = _stub_quote(out_per_btc=50000, impact=0.005)   # below repaid at any size
+        row = _hot_row()
+        st = self._st()
+        ex._arm_refresh(_ArmRpc(), [row], st, 1000.0, time.monotonic() + 5)
+        key = f"{row['market_id']}:{row['borrower']}"
+        self.assertGreater(ex._arm[key]["skip_until"], 1000.0)
+        self.assertNotIn(key, st["declined"])             # NOT the classic decline journal
+
+    def test_budget_exhausted_stops_before_quoting(self):
+        calls = {"n": 0}
+
+        def q(*a, **k):
+            calls["n"] += 1
+            raise AssertionError("must not quote past the idle budget")
+        ex.quote = q
+        ex._arm_refresh(_ArmRpc(), [_hot_row()], self._st(), 1000.0,
+                        time.monotonic() - 1)             # budget already exhausted
+        self.assertEqual(calls["n"], 0)
+        self.assertEqual(ex._arm, {})
+
+    def test_evaluate_deadline_cap_blocks_further_quotes(self):
+        # arm path: a spent idle budget must never start another Sushi round-trip
+        calls = {"n": 0}
+
+        def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005, **kw):
+            calls["n"] += 1
+            time.sleep(0.01)                              # simulate quote latency
+            out = int(amount_in_wei / 1e8 * 50000 * 1e6)  # unprofitable at every size
+            return {"amount_out": out, "price_impact": 0.005, "gas": 400000,
+                    "swap_target": "0x" + "ac" * 20, "swap_calldata": "0xbeef"}
+        ex.quote = q
+        t = _target(1.0, 61000.0)
+        ev = ex.evaluate(None, t, gas_usd=0.01, deadline_mono=time.monotonic() + 0.005)
+        self.assertIsNone(ev)
+        self.assertEqual(calls["n"], 1)                   # stopped after the first quote
+
+    def test_budget_stopped_evaluate_is_not_a_decline(self):
+        # evaluate returning None because the BUDGET ran out must NOT skip the target for
+        # DECLINE_TTL — economics were never judged; the next idle window retries
+        def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005, **kw):
+            time.sleep(0.01)
+            out = int(amount_in_wei / 1e8 * 50000 * 1e6)
+            return {"amount_out": out, "price_impact": 0.005, "gas": 400000,
+                    "swap_target": "0x" + "ac" * 20, "swap_calldata": "0xbeef"}
+        ex.quote = q
+        row = _hot_row()
+        ex._arm_refresh(_ArmRpc(), [row], self._st(), 1000.0, time.monotonic() + 0.005)
+        self.assertNotIn(f"{row['market_id']}:{row['borrower']}", ex._arm)
+
+    def test_fresh_entry_not_requoted(self):
+        row = _hot_row()
+        st = self._st()
+        ex._arm_refresh(_ArmRpc(), [row], st, 1000.0, time.monotonic() + 5)
+        calls = {"n": 0}
+
+        def q(*a, **k):
+            calls["n"] += 1
+            raise AssertionError("fresh entry must not re-quote")
+        ex.quote = q
+        ex._arm_refresh(_ArmRpc(), [row], st, 1001.0, time.monotonic() + 5)
+        self.assertEqual(calls["n"], 0)
+
+    def test_live_arming_signs_after_healthy_preflight(self):
+        ex.DRY_RUN = False
+        ex.PRIVATE_KEY = "0x" + "01" * 32
+        ex._preflight_call = lambda cd: (False, "execution reverted: position is healthy")
+        ex._rpc_write = lambda m, p, timeout=15.0: (
+            {"baseFeePerGas": hex(1_000_000)} if m == "eth_getBlockByNumber" else "0x5")
+        row = _hot_row()
+        st = self._st()
+        ex._arm_refresh(_ArmRpc(), [row], st, 1000.0, time.monotonic() + 5)
+        e = ex._arm[f"{row['market_id']}:{row['borrower']}"]
+        self.assertTrue(str(e["raw"]).startswith("0x"))   # pre-signed, nonce-frozen
+        self.assertEqual(e["fires_at_sign"], 0)
+        self.assertTrue(e["blind"])
+
+    def test_unexpected_preflight_revert_never_arms(self):
+        # arm-time preflight of a HEALTHY target must revert 'position is healthy'; anything
+        # else means broken calldata — blind-firing it would burn a fire on garbage
+        ex.DRY_RUN = False
+        ex.PRIVATE_KEY = "0x" + "01" * 32
+        ex._preflight_call = lambda cd: (False, "execution reverted: SwapFailed()")
+        row = _hot_row()
+        ex._arm_refresh(_ArmRpc(), [row], self._st(), 1000.0, time.monotonic() + 5)
+        e = ex._arm[f"{row['market_id']}:{row['borrower']}"]
+        self.assertNotIn("raw", e)
+        self.assertGreater(e["skip_until"], 1000.0)
+
+    def test_already_flipped_fires_classic_immediately(self):
+        ex.DRY_RUN = False
+        ex.PRIVATE_KEY = "0x" + "01" * 32
+        ex._preflight_call = lambda cd: (True, "")        # liquidatable RIGHT NOW
+        fired = []
+        ex.fire = lambda rpc, t, ev, st, now_ts, gas_usd: fired.append(t["borrower"])
+        row = _hot_row()
+        ex._arm_refresh(_ArmRpc(), [row], self._st(), 1000.0, time.monotonic() + 5)
+        self.assertEqual(fired, [row["borrower"]])
+        self.assertNotIn(f"{row['market_id']}:{row['borrower']}", ex._arm)
+
+    def test_fee_bid_target_is_never_blind(self):
+        # Phase 2 engaged: a reverted bid burns the bid, so the preflight eth_call must stay
+        # in the critical path — the entry arms, but with blind=False and the bid's gas cost
+        ex.DRY_RUN = False
+        ex.PRIVATE_KEY = "0x" + "01" * 32
+        ex.FEE_BID = True
+        save = (ex.FEE_BID_MIN_NET_USD, ex.ETH_USD)
+        ex.FEE_BID_MIN_NET_USD, ex.ETH_USD = 100.0, 1900.0
+        ex._preflight_call = lambda cd: (False, "execution reverted: position is healthy")
+        ex._rpc_write = lambda m, p, timeout=15.0: (
+            {"baseFeePerGas": hex(1_000_000)} if m == "eth_getBlockByNumber" else "0x5")
+        try:
+            row = _hot_row()
+            ex._arm_refresh(_ArmRpc(), [row], self._st(), 1000.0, time.monotonic() + 5)
+            e = ex._arm[f"{row['market_id']}:{row['borrower']}"]
+            self.assertGreater(e["bid_gwei"], ex.PRIORITY_GWEI)
+            self.assertFalse(e["blind"])
+            self.assertGreater(e["gas_usd"], 1.0)         # bid win-cost, not the base est
+        finally:
+            (ex.FEE_BID_MIN_NET_USD, ex.ETH_USD) = save
+
+    def test_preflight_transport_arms_without_blind(self):
+        ex.DRY_RUN = False
+        ex.PRIVATE_KEY = "0x" + "01" * 32
+
+        def boom(cd):
+            raise ex.RpcTransportError("rate limit")
+        ex._preflight_call = boom
+        ex._rpc_write = lambda m, p, timeout=15.0: (
+            {"baseFeePerGas": hex(1_000_000)} if m == "eth_getBlockByNumber" else "0x5")
+        row = _hot_row()
+        ex._arm_refresh(_ArmRpc(), [row], self._st(), 1000.0, time.monotonic() + 5)
+        e = ex._arm[f"{row['market_id']}:{row['borrower']}"]
+        self.assertFalse(e["blind"])                      # sanity check blinded -> preflight
+        self.assertTrue(str(e["raw"]).startswith("0x"))   # ... but still pre-signed
+
+
+class TestFireFast(unittest.TestCase):
+    """Armed-window critical path: blind send, bid-preflight gating, nonce-burn guard."""
+
+    def setUp(self):
+        self._save = (ex.DRY_RUN, ex._rpc_write, ex._post_broadcast, ex._preflight_call,
+                      ex.alert)
+        ex.DRY_RUN = False
+        ex.alert = lambda text, sync=False: None
+        self.sent = []
+        self.tracked = []
+
+        def rpc_write(method, params, timeout=15.0):
+            assert method == "eth_sendRawTransaction", f"unexpected {method} in critical path"
+            self.sent.append(params[0])
+            return "0x" + "ab" * 32
+        ex._rpc_write = rpc_write
+        ex._post_broadcast = lambda *a: self.tracked.append(a)
+
+    def tearDown(self):
+        (ex.DRY_RUN, ex._rpc_write, ex._post_broadcast, ex._preflight_call,
+         ex.alert) = self._save
+
+    def _entry(self, blind=True, raw="0xf86b...", age=0.0):
+        t = _hot_row()
+        ev = {"f": 1.0, "net_usd": 500.0, "net_wei": int(500e6), "repaid_shares": 1,
+              "seized_arg": 0}
+        return {"t": t, "ev": ev, "key": f"{t['market_id']}:{t['borrower']}",
+                "calldata": "0x79755efe", "raw": raw, "blind": blind, "bid_gwei": 0.001,
+                "gas_usd": 0.01, "ts": time.monotonic() - age, "fires_at_sign": 0}
+
+    def _st(self):
+        return {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0,
+                "consec_reverts": 0, "reverts": 0}
+
+    def test_blind_sends_presigned_with_zero_extra_rpc(self):
+        st = self._st()
+        e = self._entry()
+        self.assertTrue(ex._fire_fast(e, st, 1000.0))
+        self.assertEqual(self.sent, ["0xf86b..."])        # the pre-signed raw, nothing else
+        self.assertEqual(st["fires"], 1)
+        self.assertAlmostEqual(st["gas_usd"], 0.01)
+        self.assertIsNone(e["raw"])                       # nonce consumed
+        self.assertEqual(len(self.tracked), 1)            # settle handed to shared tracking
+
+    def test_send_failure_refunds_and_leaves_no_cooldown(self):
+        def boom(method, params, timeout=15.0):
+            raise ex.RpcTransportError("write RPC down")
+        ex._rpc_write = boom
+        st = self._st()
+        e = self._entry()
+        self.assertFalse(ex._fire_fast(e, st, 1000.0))
+        self.assertEqual(st["fires"], 0)                  # refunded — classic path untainted
+        self.assertEqual(st["gas_usd"], 0.0)
+        self.assertEqual(st["sent"], {})                  # NO send_error cooldown on the key
+        self.assertIsNone(e["raw"])
+
+    def test_nonce_burned_since_signing_blocks_blind(self):
+        st = self._st()
+        st["fires"] = 2                                   # someone fired after we signed
+        self.assertFalse(ex._fire_fast(self._entry(), st, 1000.0))
+        self.assertEqual(self.sent, [])
+
+    def test_stale_entry_never_fires(self):
+        st = self._st()
+        self.assertFalse(ex._fire_fast(self._entry(age=ex.ARM_QUOTE_TTL + 1), st, 1000.0))
+        self.assertEqual(self.sent, [])
+
+    def test_dry_run_prints_never_sends(self):
+        ex.DRY_RUN = True
+        self.assertFalse(ex._fire_fast(self._entry(), self._st(), 1000.0))
+        self.assertEqual(self.sent, [])
+
+    def test_dedup_respected(self):
+        st = self._st()
+        e = self._entry()
+        st["sent"][e["key"]] = {"ts": 999.0, "status": "pending"}
+        self.assertFalse(ex._fire_fast(e, st, 1000.0))
+        self.assertEqual(self.sent, [])
+
+    def test_guard_trips_before_send(self):
+        st = self._st()
+        st["consec_reverts"] = ex.MAX_CONSEC_REVERTS
+        with self.assertRaises(ex.GuardTripped):
+            ex._fire_fast(self._entry(), st, 1000.0)
+        self.assertEqual(self.sent, [])
+
+    def test_bid_entry_preflights_then_sends(self):
+        st = self._st()
+        pf = []
+        ex._preflight_call = lambda cd: (pf.append(cd) or (True, ""))
+        self.assertTrue(ex._fire_fast(self._entry(blind=False), st, 1000.0))
+        self.assertEqual(pf, ["0x79755efe"])              # preflight stayed in the path
+        self.assertEqual(len(self.sent), 1)
+
+    def test_bid_entry_lost_race_declines_not_sends(self):
+        st = self._st()
+        ex._preflight_call = lambda cd: (False, "execution reverted: position is healthy")
+        e = self._entry(blind=False)
+        self.assertFalse(ex._fire_fast(e, st, 1000.0))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(st["races_lost"], 1)
+        self.assertIn(e["key"], st["declined"])
+
+    def test_bid_entry_preflight_transport_short_backoff(self):
+        st = self._st()
+
+        def boom(cd):
+            raise ex.RpcTransportError("rate limit")
+        ex._preflight_call = boom
+        e = self._entry(blind=False)
+        self.assertFalse(ex._fire_fast(e, st, 1000.0))
+        self.assertEqual(st["declined"][e["key"]].get("ttl"), ex.TRANSIENT_BACKOFF_SEC)
+
+
+class _FakeClock:
+    """Stands in for fastpath.BlockClock inside _predictive_cycle. When wait_next yields no
+    detect, `synced_after` mimics soft (predicted anchor) vs hard (pattern broke) breaks."""
+    def __init__(self, synced=True, next_block=(101, 0.0), synced_after=False):
+        self._synced, self._next, self._after = synced, next_block, synced_after
+
+    @property
+    def synced(self):
+        return self._synced
+
+    def sync(self):
+        return None
+
+    def idle_remaining(self):
+        return 0.5
+
+    def wait_next(self):
+        if self._next is None:
+            self._synced = self._after
+        return self._next
+
+
+class _CycleRpc:
+    def __init__(self, ret_hex):
+        self.ret = ret_hex
+        self.calls = []
+
+    def warm(self, timeout=2.0):
+        return True
+
+    def eth_call(self, to, data, tag="latest", gas=None):
+        self.calls.append((to, data))
+        return self.ret
+
+
+class TestPredictiveCycle(unittest.TestCase):
+    def setUp(self):
+        self._save = (ex._arm_refresh, ex._fire_fast, ex._warm_write, ex.save_state)
+        ex._arm.clear()
+        ex._arm_refresh = lambda *a, **k: None
+        ex._warm_write = lambda: None
+        ex.save_state = lambda st: None
+
+    def tearDown(self):
+        (ex._arm_refresh, ex._fire_fast, ex._warm_write, ex.save_state) = self._save
+        ex._arm.clear()
+
+    def test_flip_fires_armed_entry(self):
+        from bot.test_fastpath import _agg3_return
+        row = _hot_row()                                  # HF just above 1
+        key = f"{row['market_id']}:{row['borrower']}"
+        ex._arm[key] = {"ev": {"x": 1}, "key": key}
+        fired = []
+        ex._fire_fast = lambda entry, st, now_ts: fired.append(entry["key"]) or True
+        # fresh price ONE wei below the flip threshold -> flipped
+        import bot.fastpath as fp
+        flip_px = fp.min_healthy_price(row["collateral"], row["lltv"], row["debt_assets"])
+        rpc = _CycleRpc(_agg3_return([(True, (flip_px - 1).to_bytes(32, "big"))]))
+        st = {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0, "consec_reverts": 0}
+        self.assertTrue(ex._predictive_cycle(rpc, _FakeClock(), [row], st))
+        self.assertEqual(fired, [key])
+        self.assertEqual(len(rpc.calls), 1)               # ONE multicall in the armed window
+        self.assertEqual(rpc.calls[0][0], ex.MULTICALL3)
+
+    def test_no_flip_no_fire(self):
+        from bot.test_fastpath import _agg3_return
+        row = _hot_row()
+        import bot.fastpath as fp
+        flip_px = fp.min_healthy_price(row["collateral"], row["lltv"], row["debt_assets"])
+        rpc = _CycleRpc(_agg3_return([(True, flip_px.to_bytes(32, "big"))]))  # AT threshold
+        fired = []
+        ex._fire_fast = lambda entry, st, now_ts: fired.append(1) or True
+        st = {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0, "consec_reverts": 0}
+        self.assertTrue(ex._predictive_cycle(rpc, _FakeClock(), [row], st))
+        self.assertEqual(fired, [])
+
+    def test_hard_break_falls_back_before_any_read(self):
+        rpc = _CycleRpc("0x")
+        st = {"sent": {}, "declined": {}}
+        clock = _FakeClock(next_block=None, synced_after=False)
+        self.assertFalse(ex._predictive_cycle(rpc, clock, [_hot_row()], st))
+        self.assertEqual(rpc.calls, [])                   # no armed-window read was wasted
+
+    def test_soft_break_stays_block_locked(self):
+        # late armed-zone entry absorbed by a predicted anchor: no fire window this block,
+        # but the loop must run the hot pass immediately (True), not sleep the classic poll
+        rpc = _CycleRpc("0x")
+        st = {"sent": {}, "declined": {}}
+        clock = _FakeClock(next_block=None, synced_after=True)
+        self.assertTrue(ex._predictive_cycle(rpc, clock, [_hot_row()], st))
+        self.assertEqual(rpc.calls, [])
 
 
 class TestFeeBid(unittest.TestCase):
