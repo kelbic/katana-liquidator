@@ -284,3 +284,56 @@ capped/uncapped, _shares_for_repaid без 0.5%-шейва (не нужен). Ф
 p50 120мс (мин 53мс) + send one-way ~110–150мс ⇒ detect→секвенсер ~0.2–0.27с — целевая полоса
 P(B0+1) 13–21% (было 7–10%). Тесты: 134/134 зелёные (было 72). Гарантии не тронуты: kill-switch,
 дедуп, флоры, sizing, бид-математика Phase 2 — тот же код, лишь вынесен раньше по времени.
+
+---
+
+**Update 2026-07-17 — mempool same-block backrun (SHADOW дефолт) + 2 мелких правки.**
+Conduit-нода `wss://rpc.katanarpc.com` (op-reth) — нетипично для OP-стека — держит ПУБЛИЧНЫЙ
+мемпул и `eth_subscribe`. Оракульный price-update виден PENDING до включения; op-reth сортирует
+по УБЫВАНИЮ эффективного prio-fee, ничьи — FCFS по приходу. На 8/8 same-block победах prio
+победителя == prio оракульного пуша ДО WEI. Отсюда same-block backrun: наша ликвидация с
+`maxPriorityFeePerGas` РОВНО равным типу пуша встаёт СРАЗУ ЗА ним в ТОМ ЖЕ блоке (пуш двигает
+цену → наша tx после него видит новую цену и ликвидирует). Промах реверт на ~$0.01 газа —
+та же экономика, что blind-fire на низком типе. Слоёв (аддитивно к v3 next-block, за флагами):
+- **WSS-менеджер** (`bot/mempool.py`, `KT_MEMPOOL=1`): фоновый поток, персистентный сокет с
+  reconnect+backoff, подписки newHeads + newPendingTransactions. Свой транспорт и своя read-
+  линия для тел tx — НЕ трогает пул `analysis.rpc` и не пишущую линию. Главный цикл никогда не
+  блокируется на сокете (lock-снапшот головы + колбэк). Обрыв WSS = громкий лог + reconnect;
+  предиктивный поллинг next-block работает независимо (мёртвый WSS = «нет same-block попыток»).
+- **Оракульный конфиг** (`bot/oracles.py`): зеркало read-only ценза (`infra_oracle_census/
+  _feeds`, 2026-07-17) — Chainlink-агрегаторы (BTC/ETH/LBTC/USDC/USD, WBTC/BTC) + комитеты
+  трансмиттер-EOA на фид + какие фиды двигают каждый из 6 рынков. `markets_for_tx(to,from)`:
+  агрегатор `to` однозначен (1 фид), трансмиттер `from` широкий (комитеты общие) → объединение
+  кандидат-рынков (graceful degrade: армим все hot-цели в них, флип-чек подтверждает по факту).
+- **Same-block отправка** (`bot/executor.py`): на пуш — по каждой pre-armed цели рынка пере-
+  подписываем calldata с типом пуша (matched-to-wei, замороженные нонс+base) и шлём на
+  ВЫДЕЛЕННОЙ пишущей линии. Клейм fires/нонса под `_fire_lock`+fires_at_sign, поэтому same-
+  block и next-block `_fire_fast` не могут дважды потратить нонс. Сеттл — через pending-запись
+  главному циклу (`_check_pending`). Безопасность: fee-bid-тикет (бид > типа пуша) и тип выше
+  потолка `KT_MEMPOOL_MAX_TIP_GWEI`=0.5 НЕ шлются слепо (держат preflight/уходят в next-block)
+  — никогда не «слепой fire на высоком типе».
+- **SHADOW дефолт** (`KT_MEMPOOL_SHADOW=1`): всё КРОМЕ `eth_sendRawTransaction` — строка
+  `MEMPOOL …`. Реал-firing: `KT_MEMPOOL_SHADOW=0 KT_MEMPOOL_LIVE=1` после ревью shadow-данных.
+
+Грамматика shadow-лога (для grep-анализатора; `MEMPOOL ` + key=value, `-`=нет значения):
+  `event=signal`      — увиден пуш: market, tip_wei, tip_gwei, oracle_tx, detect_ms, head_block,
+                        head_age_ms, n_armed.
+  `event=shadow_fire` — какую armed-цель бэкранули бы: +market_id, borrower, hf, would_send_ms,
+                        blind, send_ms_est(=KT_MEMPOOL_SEND_MS 216), head_age_ms, budget_ms,
+                        feasible(0|1). `shadow_skip` (+reason) — если fee-bid тикет.
+  `event=landed`      — резолюция: oracle_tx, landed_block, detect_head, blocks_after.
+  live-режим: `event=live_fire`(+txh) / `live_skip`(+reason) / `live_miss`(+reason).
+budget_ms = (BLOCK_SEC*1000 − head_age_ms) + CUTOFF_MS − (would_send_ms + SEND_MS); feasible =
+budget_ms>0 — оценка «успели бы в блок пуша». Правда — из `landed` (реальный блок включения).
+ЧЕСТНАЯ ОГОВОРКА: наш ~216мс write до US-секвенсера vs окно ~0.25–0.35с — same-block на грани;
+shadow это и измерит (budget_ms + landed по факту) ДО включения live.
+
+**Мелочь 1 — arm-квота Sushi:** пре-арм квота больше не стартует, если не влезает в остаток idle-
+бюджета (таймаут = min(QUOTE_TIMEOUT, остаток), 1 попытка, флор `KT_QUOTE_MIN_TIMEOUT`=0.35с).
+Убирает «evaluate deadline exceeded, giving up this pass» на weETH/vbETH (Partial-квоты).
+**Мелочь 2 — тихие гонки:** каждая проигранная гонка ЛОГируется с призом (`(LIF−1)*repaid_usd`,
+без RPC) и тегом (below_floor/tracked_lost/not_tracked), но пингует TG только если приз
+неизвестен (fail-open) или ≥ `KT_RACE_ALERT_MIN_USD` (дефолт = профит-флор). `KT_RACE_ALERT_MAX`
+кэпит пинги за пасс. Дустовые гонки (репэй ~$5.30, бонус ~$0.23) больше не спамят.
+
+Тесты: 202/202 зелёные (было 134). Экономика/гарды/sizing/kill-switch/Phase-2 не тронуты.
