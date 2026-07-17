@@ -41,7 +41,16 @@ Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFI
   KT_ARM_HF (1.002) / KT_ARM_MAX_N (4) / KT_ARM_QUOTE_TTL (2.5s) — pre-arm window,
   KT_BLIND_FIRE (1) — skip preflight in the critical path at the default tip only,
   KT_PREDICT_WINDOW (0.80) / KT_PREDICT_STEP (0.018) / KT_PREDICT_SLACK (0.75) /
-  KT_BLOCK_SEC (1.0) — boundary timing (bot/fastpath.py).
+  KT_BLOCK_SEC (1.0) — boundary timing (bot/fastpath.py),
+  KT_MEMPOOL (1) — mempool same-block backrun layer (bot/mempool.py; needs KT_PREDICTIVE_POLL),
+  KT_MEMPOOL_SHADOW (1) — default ON: measure same-block feasibility, NO send/spend,
+  KT_MEMPOOL_LIVE (0) — real same-block firing (only with SHADOW=0 + live executor),
+  KT_MEMPOOL_SEND_MS (216) / KT_MEMPOOL_CUTOFF_MS (300) — shadow feasibility model,
+  KT_MEMPOOL_MAX_TIP_GWEI (0.5) — matched-tip safety ceiling above which a same-block fire keeps
+  preflight (never blind-fires high), KT_MEMPOOL_SEND_URL (=KT_RPC) — same-block write lane,
+  KT_MEMPOOL_WSS_URL (wss://rpc.katanarpc.com) / KT_MEMPOOL_HTTP_URL (https://rpc.katanarpc.com),
+  KT_RACE_ALERT_MIN_USD (=KT_MIN_PROFIT_USD) — only alert competitor races worth this much (all
+  races still logged + counted).
 
 Go-live preflight: `pip install -r requirements.txt` (eth_account for KT_RAW_TX=1) — the loop
 verifies deps/contract/chainId at startup and exits loudly if broken (never silently).
@@ -75,6 +84,7 @@ from analysis.multicall import MULTICALL3                              # noqa: E
 from analysis.protocols import MORPHO, STABLES, TOKENS                 # noqa: E402
 from analysis.rpc import DEFAULT_RPCS, Rpc                             # noqa: E402
 from bot import fastpath                                               # noqa: E402
+from bot import oracles                                               # noqa: E402
 from bot.sushi import quote, NoRouteError, SWAP_INPUT_HAIRCUT         # noqa: E402
 
 # --- config -------------------------------------------------------------------
@@ -180,6 +190,37 @@ ARM_QUOTE_TTL = float(os.environ.get("KT_ARM_QUOTE_TTL", "2.5"))  # armed quote/
 # preflight eth_call (~1 warm RTT) in its critical path. KT_BLIND_FIRE=0 forces preflight
 # for every fast fire.
 BLIND_FIRE = os.environ.get("KT_BLIND_FIRE", "1") == "1"
+
+# --- mempool same-block backrun layer (bot/mempool.py; ADDITIVE to the v3 next-block path) ---
+# The Conduit op-reth node exposes a PUBLIC mempool: an oracle price-update tx is visible
+# PENDING before it lands. op-reth orders by DESCENDING effective priority fee, ties broken FCFS
+# by arrival — so submitting our liquidation with maxPriorityFeePerGas EXACTLY EQUAL to the
+# pending oracle push's tip sorts us right BEHIND it in the SAME block: the push flips the price,
+# our tx (executing after it) sees the new price and liquidates. A miss reverts for only the
+# matched (tiny) tip's gas — the same economics as the existing blind-fire-at-low-tip policy.
+# SHADOW is the default: do everything EXCEPT eth_sendRawTransaction and log a MEMPOOL line so
+# real same-block feasibility + lead-time are measured with ZERO risk/spend. The operator flips
+# to real firing with KT_MEMPOOL_SHADOW=0 KT_MEMPOOL_LIVE=1 after reviewing the shadow data. The
+# v3 next-block pre-armed path stays LIVE regardless — this only ADDS a same-block attempt.
+MEMPOOL = os.environ.get("KT_MEMPOOL", "1") == "1"
+MEMPOOL_SHADOW = os.environ.get("KT_MEMPOOL_SHADOW", "1") != "0"    # default ON (measure only)
+MEMPOOL_LIVE = os.environ.get("KT_MEMPOOL_LIVE", "0") == "1"        # real same-block firing
+MEMPOOL_SEND_MS = float(os.environ.get("KT_MEMPOOL_SEND_MS", "216"))   # measured write->seq (ms)
+MEMPOOL_CUTOFF_MS = float(os.environ.get("KT_MEMPOOL_CUTOFF_MS", "300"))  # same-block cutoff (ms)
+# Safety ceiling: a same-block fire matches the oracle tip, which is always tiny (measured max
+# ~0.019 gwei -> ~$0.01 revert). A matched tip ABOVE this ceiling is NOT a low-tip fire, so it
+# keeps preflight in the path (never silently blind-fires high) — the same rule as the fastpath.
+MEMPOOL_MAX_TIP_GWEI = float(os.environ.get("KT_MEMPOOL_MAX_TIP_GWEI", "0.5"))
+MEMPOOL_SEND_URL = os.environ.get("KT_MEMPOOL_SEND_URL", RPC_WRITE)
+_DEFAULT_TIP_WEI = int(PRIORITY_GWEI * 1e9)
+_MEMPOOL_MAX_TIP_WEI = int(MEMPOOL_MAX_TIP_GWEI * 1e9)
+
+
+def _same_block_live() -> bool:
+    """Real same-block firing is gated: mempool on, LIVE explicitly set, SHADOW explicitly off,
+    and the executor already live (not DRY_RUN, contract set). Any weaker config stays shadow."""
+    return MEMPOOL and MEMPOOL_LIVE and not MEMPOOL_SHADOW and not DRY_RUN and bool(CONTRACT)
+
 
 # fire-path tuning (review H7/H8): tight quote timeouts, bounded receipt wait, short success-
 # dedup so the REMAINDER of a chunked close is re-taken immediately instead of gifted for 5min.
@@ -940,10 +981,243 @@ def _arm_refresh(rpc: Rpc, rows: list[dict], st: dict, now_ts: float,
                 nonce = int(_rpc_write("eth_getTransactionCount", [addr, "pending"]), 16)
                 entry["raw"] = _sign_liquidate(nonce, max_fee, priority, entry["calldata"])
                 entry["fires_at_sign"] = st.get("fires", 0)
+                # the same-block layer RE-signs this calldata with the pending oracle push's
+                # matched tip, so it needs the frozen nonce + the (pinned) base fee to rebuild
+                # maxFee without an RPC in the reaction path.
+                entry["nonce"] = nonce
+                entry["base_fee"] = max(0, (max_fee - priority) // 2)
             except Exception as err:
                 print(f"  arm sign failed (classic path covers): {str(err)[:120]}")
                 continue
         _arm[key] = entry
+    _publish_arm_snapshot()
+
+
+# --- mempool same-block backrun (bot/mempool.py; runs in the WSS thread) --------------------
+# The mempool thread reads the CURRENT armed set through a lock-guarded snapshot (never _arm
+# directly — _arm_refresh mutates it across seconds of quoting) and claims a fire through
+# _fire_lock, so a same-block fire and the main loop's next-block _fire_fast can never both
+# consume the same nonce (the loser sees fires_at_sign != st['fires'] and aborts). Shadow mode
+# touches NO shared state — it only reads the snapshot and logs a MEMPOOL line.
+_arm_lock = threading.Lock()
+_fire_lock = threading.Lock()
+_arm_snapshot: dict[str, list[dict]] = {}   # marketId(lower) -> [armed entry]
+
+
+def _publish_arm_snapshot() -> None:
+    """Group the currently-armed entries by market for the mempool thread. Called at the end of
+    every _arm_refresh; the snapshot references the same entry dicts (immutable after arm, bar
+    entry['raw'] which the same-block path never touches — it re-signs its own tx)."""
+    snap: dict[str, list[dict]] = {}
+    for e in _arm.values():
+        if not e.get("ev"):
+            continue
+        snap.setdefault(e["t"]["market_id"].lower(), []).append(e)
+    with _arm_lock:
+        global _arm_snapshot
+        _arm_snapshot = snap
+
+
+def _armed_for_markets(market_ids: set[str]) -> list[dict]:
+    with _arm_lock:
+        return [e for m in market_ids for e in _arm_snapshot.get(m.lower(), [])]
+
+
+def _mempool_log(**kw) -> None:
+    """One stable, greppable line per same-block event. Prefix 'MEMPOOL '; space-separated
+    key=value pairs; '-' for absent values. See STATE.md / the shadow analyzer contract."""
+    def fmt(v):
+        if v is None:
+            return "-"
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        if isinstance(v, float):
+            return f"{v:.1f}"
+        return str(v)
+    kw.setdefault("ts", round(time.time(), 3))
+    print("MEMPOOL " + " ".join(f"{k}={fmt(v)}" for k, v in kw.items()))
+
+
+def _same_block_tip(entry: dict, tip_wei: int) -> tuple[int, bool, str]:
+    """Decide the same-block tip + whether it may fire blind. We MATCH the oracle push's tip
+    (tiny) and never escalate: a FEE_BID ticket whose intended bid exceeds the matched tip is
+    NOT blind-fired here (it goes through the deliberate next-block bid+preflight path), and a
+    matched tip above the safety ceiling keeps preflight. Returns (tip_wei, blind, skip_reason);
+    skip_reason non-empty means 'do not same-block fire this entry'."""
+    bid_wei = int(round(entry.get("bid_gwei", PRIORITY_GWEI) * 1e9))
+    if FEE_BID and bid_wei > tip_wei:
+        return tip_wei, False, "fee_bid_ticket"       # escalation ticket -> next-block path
+    blind = bool(entry.get("blind")) and tip_wei <= _MEMPOOL_MAX_TIP_WEI
+    return tip_wei, blind, ""
+
+
+def _shadow_same_block(entry: dict, sig) -> None:
+    """SHADOW: everything up to (not including) eth_sendRawTransaction, then log. Measures the
+    real detect->would-send latency and estimates whether we'd have made the oracle's block."""
+    t = entry["t"]
+    tip_wei = sig.tip_wei if sig.tip_wei is not None else 0
+    _, blind, skip = _same_block_tip(entry, tip_wei)
+    would_send_ms = (time.monotonic() - sig.detect_mono) * 1000.0
+    # feasibility estimate: the push is pending head_age_ms into block N; it most likely lands at
+    # the next boundary. Our tx, ready would_send_ms after detect and MEMPOOL_SEND_MS on the
+    # wire, must arrive before that block's cutoff. budget>0 => plausibly same-block.
+    head_age = sig.head_age_ms if sig.head_age_ms is not None else 0.0
+    budget_ms = ((fastpath.BLOCK_SEC * 1000.0 - head_age) + MEMPOOL_CUTOFF_MS
+                 - (would_send_ms + MEMPOOL_SEND_MS))
+    _mempool_log(event=("shadow_skip" if skip else "shadow_fire"), mode="shadow",
+                 market=oracles.market_pair(t["market_id"]), market_id=t["market_id"][:10],
+                 borrower=t["borrower"][:10], hf=round(t.get("hf", 0.0), 4),
+                 tip_wei=tip_wei, tip_gwei=round(tip_wei / 1e9, 6), oracle_tx=sig.tx_hash,
+                 would_send_ms=would_send_ms, blind=blind, send_ms_est=MEMPOOL_SEND_MS,
+                 head_age_ms=sig.head_age_ms, budget_ms=budget_ms,
+                 feasible=(budget_ms > 0.0), reason=(skip or None))
+
+
+def _mempool_send_raw(raw_hex: str, timeout: float = 8.0) -> str:
+    """Dedicated write lane for the same-block backrun — its OWN kept-alive connection so it
+    never corrupts the main loop's _write_conn from another thread. Reconnect-once."""
+    global _mp_write_conn
+    body = json.dumps({"jsonrpc": "2.0", "id": 1,
+                       "method": "eth_sendRawTransaction", "params": [raw_hex]})
+    last = None
+    for _ in range(2):
+        try:
+            if _mp_write_conn is None:
+                u = urllib.parse.urlsplit(MEMPOOL_SEND_URL)
+                cls = (http.client.HTTPSConnection if u.scheme == "https"
+                       else http.client.HTTPConnection)
+                _mp_write_conn = cls(u.netloc, timeout=timeout)
+                _mp_write_conn._kt_path = u.path or "/"
+            _mp_write_conn.request("POST", _mp_write_conn._kt_path, body,
+                                   {"Content-Type": "application/json",
+                                    "User-Agent": "Mozilla/5.0"})
+            d = json.loads(_mp_write_conn.getresponse().read())
+            if d.get("error"):
+                raise RuntimeError(f"send: {d['error']}")
+            return d["result"]
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            last = e
+            try:
+                _mp_write_conn.close()
+            except Exception:
+                pass
+            _mp_write_conn = None
+    raise RuntimeError(f"mempool send transport: {last}")
+
+
+_mp_write_conn: http.client.HTTPConnection | None = None
+
+
+def _fire_same_block(entry: dict, sig, st: dict) -> bool:
+    """LIVE same-block backrun: re-sign the armed calldata with the pending oracle tip (matched
+    to the wei) and broadcast on the dedicated write lane, racing to land right behind the push
+    in the SAME block. Thread-safe: the fires/nonce claim is under _fire_lock and guarded by
+    fires_at_sign, so the next-block _fire_fast can never double-spend the nonce. A miss reverts
+    for the matched (tiny) tip's gas; the next-block armed path remains the automatic fallback.
+    Settlement is handed to the main loop via a pending 'sent' record (never touches the main
+    write lane from this thread). Returns True iff a broadcast happened."""
+    t = entry["t"]
+    key = entry["key"]
+    tip_wei = sig.tip_wei
+    if tip_wei is None or not entry.get("raw") or entry.get("nonce") is None:
+        _mempool_log(event="live_skip", mode="live", market=oracles.market_pair(t["market_id"]),
+                     borrower=t["borrower"][:10], oracle_tx=sig.tx_hash, reason="unsigned")
+        return False
+    tip_wei, blind, skip = _same_block_tip(entry, tip_wei)
+    if skip:
+        _mempool_log(event="live_skip", mode="live", market=oracles.market_pair(t["market_id"]),
+                     borrower=t["borrower"][:10], oracle_tx=sig.tx_hash, tip_wei=tip_wei,
+                     reason=skip)
+        return False
+    now_ts = time.time()
+    # above-default / non-blind matched tips keep preflight — but a preflight before the push
+    # lands reads the OLD price and would revert 'healthy', defeating same-block; so a non-blind
+    # same-block entry is not fired here (it will be taken next-block once the price actually
+    # lands). Only blind (low matched-tip) entries same-block fire.
+    if not blind:
+        _mempool_log(event="live_skip", mode="live", market=oracles.market_pair(t["market_id"]),
+                     borrower=t["borrower"][:10], oracle_tx=sig.tx_hash, tip_wei=tip_wei,
+                     reason="needs_preflight")
+        return False
+    gas_est = GAS_UNITS_EST * (entry.get("base_fee", 0) + tip_wei) / 1e18 * ETH_USD
+    with _fire_lock:                       # atomic claim: guards + nonce-not-burned + charge
+        ok, reason = guard_ok(st)
+        if not ok:
+            raise GuardTripped(reason)
+        if recently_fired(st, key, now_ts) or recently_declined(st, key, now_ts):
+            return False
+        if time.monotonic() - entry.get("ts", 0) > ARM_QUOTE_TTL:
+            return False
+        if entry.get("fires_at_sign") != st.get("fires", 0):
+            return False                   # a fire consumed the nonce since arming
+        try:
+            raw_hex = _sign_liquidate(entry["nonce"], entry["base_fee"] * 2 + tip_wei,
+                                      tip_wei, entry["calldata"])
+        except Exception as e:
+            _mempool_log(event="live_skip", mode="live", borrower=t["borrower"][:10],
+                         oracle_tx=sig.tx_hash, reason=f"sign:{str(e)[:40]}")
+            return False
+        st["fires"] += 1
+        st["gas_usd"] += gas_est
+        entry["fires_at_sign"] = -1        # burn this entry's nonce for the next-block path too
+    try:
+        txh = _mempool_send_raw(raw_hex)
+    except Exception as e:
+        with _fire_lock:                   # refund — next-block path retries untainted
+            st["fires"] -= 1
+            st["gas_usd"] -= gas_est
+        _mempool_log(event="live_miss", mode="live", borrower=t["borrower"][:10],
+                     oracle_tx=sig.tx_hash, reason=f"send:{str(e)[:60]}")
+        return False
+    would_send_ms = (time.monotonic() - sig.detect_mono) * 1000.0
+    with _fire_lock:                       # hand settlement to the main loop's _check_pending
+        st["sent"][key] = {"tx": txh, "ts": now_ts, "status": "pending",
+                           "calldata": entry["calldata"], "gas_est": gas_est}
+    _mempool_log(event="live_fire", mode="live", market=oracles.market_pair(t["market_id"]),
+                 market_id=t["market_id"][:10], borrower=t["borrower"][:10], tip_wei=tip_wei,
+                 tip_gwei=round(tip_wei / 1e9, 6), oracle_tx=sig.tx_hash, txh=txh,
+                 would_send_ms=would_send_ms, head_age_ms=sig.head_age_ms)
+    alert(f"⚡ same-block sent {txh} {t['borrower'][:10]}… tip={tip_wei/1e9:.6f}gwei "
+          f"behind oracle {sig.tx_hash[:12]}…")
+    return True
+
+
+def _mempool_signal(sig, st: dict) -> None:
+    """on_signal (WSS thread): an oracle push is pending. Log it, then for every armed target in
+    the market(s) it will reprice, shadow-measure or same-block fire. Never raises out (the
+    manager isolates callbacks, but we keep the loop clean)."""
+    armed = _armed_for_markets(sig.market_ids)
+    detect_ms = (time.monotonic() - sig.detect_mono) * 1000.0
+    pair = ",".join(sorted(oracles.market_pair(m) for m in sig.market_ids))
+    _mempool_log(event="signal", mode=("live" if _same_block_live() else "shadow"), market=pair,
+                 tip_wei=sig.tip_wei, tip_gwei=(None if sig.tip_wei is None
+                                                else round(sig.tip_wei / 1e9, 6)),
+                 oracle_tx=sig.tx_hash, detect_ms=detect_ms, head_block=sig.head_block,
+                 head_age_ms=sig.head_age_ms, n_armed=len(armed))
+    live = _same_block_live()
+    for entry in armed:
+        try:
+            if live:
+                _fire_same_block(entry, sig, st)
+            else:
+                _shadow_same_block(entry, sig)
+        except GuardTripped as g:
+            _mempool_log(event="live_skip", mode="live", oracle_tx=sig.tx_hash,
+                         reason=f"guard:{str(g)[:40]}")
+            return
+        except Exception as e:
+            _mempool_log(event="error", oracle_tx=sig.tx_hash, reason=str(e)[:80])
+
+
+def _mempool_resolve(sig) -> None:
+    """on_resolve (WSS thread): the oracle push landed (or was dropped). Emit the block it landed
+    in so the analyzer can correlate our measured would-send timing against real inclusion."""
+    detect_head, landed = sig.head_block, sig.landed_block
+    blocks_after = (landed - detect_head if (landed is not None and detect_head is not None)
+                    else None)
+    _mempool_log(event="landed", mode=("live" if _same_block_live() else "shadow"),
+                 oracle_tx=sig.tx_hash, landed_block=landed, detect_head=detect_head,
+                 blocks_after=blocks_after)
 
 
 def _fire_fast(entry: dict, st: dict, now_ts: float) -> bool:
@@ -989,8 +1263,11 @@ def _fire_fast(entry: dict, st: dict, now_ts: float) -> bool:
                 print(f"  fast preflight revert (NOT sent, zero gas): {why[:160]}")
             st["declined"][key] = {"ts": now_ts}
             return False
-    st["fires"] += 1
-    st["gas_usd"] += entry["gas_usd"]
+    with _fire_lock:                      # atomic claim vs a concurrent same-block fire: whoever
+        if entry.get("fires_at_sign") != st.get("fires", 0):   # increments st['fires'] first
+            return False                  # wins the nonce; the other aborts here
+        st["fires"] += 1
+        st["gas_usd"] += entry["gas_usd"]
     try:
         txh = _rpc_write("eth_sendRawTransaction", [entry["raw"]])
     except Exception as e:
@@ -1213,6 +1490,19 @@ def _shares_for_repaid(rpc: Rpc, t: dict) -> int:
     return borrow_shares * t["repaid_assets"] // t["debt_assets"]
 
 
+_mempool_client_ref = None   # set by _start_mempool; read for heartbeat telemetry
+
+
+def _mempool_health_str() -> str:
+    c = _mempool_client_ref
+    if c is None:
+        return ""
+    s = c.stats
+    return (f" mempool={'up' if c.healthy() else 'DOWN'} "
+            f"(oracle_hits {s['oracle_hits']}, reconnects {s['reconnects']}, "
+            f"{'live' if _same_block_live() else 'shadow'})")
+
+
 def heartbeat(st: dict) -> None:
     if HEARTBEAT_SEC <= 0:
         return
@@ -1223,7 +1513,7 @@ def heartbeat(st: dict) -> None:
     alert(f"💓 katana executor alive: passes {st['passes']}, fires {st['fires']}, "
           f"reverts {st['reverts']}, races lost {st.get('races_lost', 0)}, "
           f"gas today ${st['gas_usd']:.2f}/${MAX_DAILY_GAS_USD}. "
-          f"DRY_RUN={'on' if DRY_RUN else 'OFF'}.")
+          f"DRY_RUN={'on' if DRY_RUN else 'OFF'}.{_mempool_health_str()}")
 
 
 _last_balance_check = 0.0
@@ -1330,6 +1620,27 @@ def _kill(st: dict, g: Exception) -> None:
     sys.exit(1)   # non-zero: a supervisor must see this as FAILURE, not exit 0 (C4)
 
 
+def _start_mempool(st: dict):
+    """Start the WSS mempool manager (daemon thread) if enabled. Returns the client or None.
+    Requires predictive mode (same-block reuses the pre-armed entries). Failing to start is
+    NON-fatal — the v3 next-block path keeps firing; we just get no same-block attempts."""
+    if not (MEMPOOL and PREDICTIVE_POLL):
+        return None
+    try:
+        from bot.mempool import MempoolClient
+        client = MempoolClient(on_signal=lambda s: _mempool_signal(s, st),
+                               on_resolve=_mempool_resolve)
+        client.start()
+    except Exception as e:
+        print(f"[mempool] failed to start (predictive next-block path unaffected): {e}")
+        return None
+    mode = "LIVE same-block firing" if _same_block_live() else "SHADOW (measure only, no spend)"
+    print(f"[mempool] same-block backrun layer started — {mode}")
+    global _mempool_client_ref
+    _mempool_client_ref = client
+    return client
+
+
 def loop() -> None:
     startup_preflight()
     st = load_state()
@@ -1359,6 +1670,7 @@ def loop() -> None:
         read_rpc = Rpc(READ_RPCS or list(DEFAULT_RPCS), retries=2, min_interval=0.0,
                        backoff_429=0.05, timeout=3.0)
         clock = fastpath.BlockClock(read_rpc.poll_block_number)
+    mempool_client = _start_mempool(st)
     while True:
         try:
             # refresh the Morpho-indexer borrower set every API_REFRESH_SEC; between refreshes,

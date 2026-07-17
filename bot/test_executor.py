@@ -1,5 +1,7 @@
 """Offline tests for the executor's pure logic (no RPC, no network). The Sushi quote is stubbed
 so chunk selection, the profit gate, and calldata encoding are tested deterministically."""
+import contextlib
+import io
 import json
 import os
 import time
@@ -12,6 +14,7 @@ os.environ.setdefault("KT_MAX_IMPACT", "0.02")
 os.environ.setdefault("KT_CONTRACT", "0x000000000000000000000000000000000000bEEF")
 
 from bot import executor as ex  # noqa: E402
+from bot.mempool import OracleSignal  # noqa: E402
 
 VBUSDC = "0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36"
 VBWBTC = "0x0913DA6Da4b42f538B445599b46Bb4622342Cf52"
@@ -985,6 +988,265 @@ class TestFeeBid(unittest.TestCase):
         self.assertLess(g, 600.0)
         self.assertGreaterEqual(800 - cost, ex.FEE_BID_KEEP_USD - 1)    # keeps ~>= FEE_BID_KEEP_USD
         self.assertLessEqual(800 - cost, ex.FEE_BID_KEEP_USD + 1)
+
+
+def _arm_entry(blind=True, bid_gwei=0.001, raw="0xf86bpresigned", nonce=7,
+               base_fee=1_000_000, fires_at_sign=0, age=0.0):
+    """An armed entry shaped like _arm_refresh produces (with the same-block nonce/base_fee)."""
+    t = _hot_row()
+    ev = {"f": 1.0, "net_usd": 500.0, "net_wei": int(500e6), "repaid_shares": 1,
+          "seized_arg": 0, "impact": 0.008}
+    return {"t": t, "ev": ev, "key": f"{t['market_id']}:{t['borrower']}",
+            "calldata": "0x79755efe", "raw": raw, "blind": blind, "bid_gwei": bid_gwei,
+            "gas_usd": 0.01, "ts": time.monotonic() - age, "fires_at_sign": fires_at_sign,
+            "nonce": nonce, "base_fee": base_fee}
+
+
+def _sig(entry, tip_wei=3376432, head_age_ms=50.0, detect_ago=0.0):
+    return OracleSignal(
+        tx_hash="0x" + "ab" * 32, frm="0x" + "7f" * 20, to="0x120e6016cde",
+        market_ids={entry["t"]["market_id"].lower()}, tip_wei=tip_wei,
+        detect_mono=time.monotonic() - detect_ago, detect_wall=time.time(),
+        head_block=100, head_age_ms=head_age_ms)
+
+
+def _capture(fn, *a, **k):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn(*a, **k)
+    return buf.getvalue()
+
+
+def _mp_lines(text):
+    return [ln for ln in text.splitlines() if ln.startswith("MEMPOOL ")]
+
+
+def _fields(line):
+    return dict(p.split("=", 1) for p in line.split()[1:])
+
+
+class TestArmSnapshot(unittest.TestCase):
+    def setUp(self):
+        ex._arm.clear()
+        with ex._arm_lock:
+            ex._arm_snapshot = {}
+
+    def tearDown(self):
+        ex._arm.clear()
+
+    def test_publish_groups_by_market(self):
+        e = _arm_entry()
+        mid = e["t"]["market_id"].lower()
+        ex._arm[e["key"]] = e
+        ex._arm[":skip"] = {"skip_until": time.time() + 60}      # skip record -> not published
+        ex._publish_arm_snapshot()
+        self.assertEqual(ex._armed_for_markets({mid}), [e])
+        self.assertEqual(ex._armed_for_markets({"0x" + "00" * 32}), [])
+
+
+class TestSameBlockTip(unittest.TestCase):
+    def setUp(self):
+        self._save = (ex.FEE_BID, ex._MEMPOOL_MAX_TIP_WEI)
+
+    def tearDown(self):
+        (ex.FEE_BID, ex._MEMPOOL_MAX_TIP_WEI) = self._save
+
+    def test_default_low_tip_is_blind(self):
+        ex.FEE_BID = False
+        tip, blind, skip = ex._same_block_tip(_arm_entry(blind=True), 3376432)
+        self.assertEqual(tip, 3376432)                          # matched to the wei
+        self.assertTrue(blind)
+        self.assertEqual(skip, "")
+
+    def test_fee_bid_ticket_skipped(self):
+        ex.FEE_BID = True
+        # a ticket whose intended bid (5 gwei) exceeds the matched oracle tip -> not same-block
+        _, blind, skip = ex._same_block_tip(_arm_entry(blind=False, bid_gwei=5.0), 3376432)
+        self.assertEqual(skip, "fee_bid_ticket")
+        self.assertFalse(blind)
+
+    def test_tip_above_ceiling_keeps_preflight(self):
+        ex.FEE_BID = False
+        ex._MEMPOOL_MAX_TIP_WEI = int(0.5 * 1e9)
+        _, blind, skip = ex._same_block_tip(_arm_entry(blind=True), int(0.6 * 1e9))
+        self.assertFalse(blind)                                 # above ceiling -> not blind
+        self.assertEqual(skip, "")
+
+
+class TestShadowSameBlock(unittest.TestCase):
+    def test_shadow_fire_logs_and_never_sends(self):
+        sent = []
+        save = ex._mempool_send_raw
+        ex._mempool_send_raw = lambda *a, **k: sent.append(a) or "0x"
+        try:
+            e = _arm_entry()
+            out = _capture(ex._shadow_same_block, e, _sig(e))
+        finally:
+            ex._mempool_send_raw = save
+        self.assertEqual(sent, [])                              # SHADOW never sends
+        lines = _mp_lines(out)
+        self.assertEqual(len(lines), 1)
+        f = _fields(lines[0])
+        self.assertEqual(f["event"], "shadow_fire")
+        self.assertEqual(f["mode"], "shadow")
+        self.assertEqual(f["tip_wei"], "3376432")
+        self.assertEqual(f["blind"], "1")
+        self.assertIn("would_send_ms", f)
+        self.assertIn("budget_ms", f)
+        self.assertIn("feasible", f)
+
+    def test_shadow_feasible_flag_reflects_budget(self):
+        e = _arm_entry()
+        # detected early in the block (age 10ms) -> plenty of budget -> feasible
+        f = _fields(_mp_lines(_capture(ex._shadow_same_block, e, _sig(e, head_age_ms=10.0)))[0])
+        self.assertEqual(f["feasible"], "1")
+
+
+class TestMempoolSignalDispatch(unittest.TestCase):
+    def setUp(self):
+        self._save = (ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE, ex.DRY_RUN)
+        ex._arm.clear()
+        with ex._arm_lock:
+            ex._arm_snapshot = {}
+
+    def tearDown(self):
+        (ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE, ex.DRY_RUN) = self._save
+        ex._arm.clear()
+
+    def test_signal_logs_and_shadow_fires_each_armed(self):
+        ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE = True, True, False
+        e = _arm_entry()
+        ex._arm[e["key"]] = e
+        ex._publish_arm_snapshot()
+        out = _capture(ex._mempool_signal, _sig(e), {"sent": {}, "fires": 0})
+        events = [_fields(ln)["event"] for ln in _mp_lines(out)]
+        self.assertIn("signal", events)
+        self.assertIn("shadow_fire", events)
+        sig_line = _fields([ln for ln in _mp_lines(out) if "event=signal" in ln][0])
+        self.assertEqual(sig_line["n_armed"], "1")
+        self.assertEqual(sig_line["mode"], "shadow")
+
+    def test_signal_with_no_armed_target_still_logs(self):
+        ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE = True, True, False
+        e = _arm_entry()                                        # armed but NOT published
+        out = _capture(ex._mempool_signal, _sig(e), {"sent": {}, "fires": 0})
+        events = [_fields(ln)["event"] for ln in _mp_lines(out)]
+        self.assertEqual(events, ["signal"])                   # only the signal, no fire
+        self.assertEqual(_fields(_mp_lines(out)[0])["n_armed"], "0")
+
+
+class TestFireSameBlockLive(unittest.TestCase):
+    """LIVE same-block: re-sign at the matched tip, send on the dedicated lane, hand settlement
+    to the main loop; nonce-claim under _fire_lock, fee-bid/non-blind gating, refund on miss."""
+
+    def setUp(self):
+        self._save = (ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE, ex.DRY_RUN, ex.CONTRACT,
+                      ex.FEE_BID, ex._sign_liquidate, ex._mempool_send_raw, ex.alert)
+        ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE = True, False, True
+        ex.DRY_RUN, ex.CONTRACT, ex.FEE_BID = False, "0x" + "be" * 20, False
+        ex._sign_liquidate = lambda nonce, max_fee, prio, cd: f"0xsigned_{nonce}_{prio}"
+        self.sent = []
+        ex._mempool_send_raw = lambda raw, timeout=8.0: (self.sent.append(raw)
+                                                         or "0x" + "cd" * 32)
+        ex.alert = lambda *a, **k: None
+
+    def tearDown(self):
+        (ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE, ex.DRY_RUN, ex.CONTRACT,
+         ex.FEE_BID, ex._sign_liquidate, ex._mempool_send_raw, ex.alert) = self._save
+
+    def _st(self):
+        return {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0,
+                "consec_reverts": 0, "reverts": 0}
+
+    def test_live_gating_active(self):
+        self.assertTrue(ex._same_block_live())
+
+    def test_blind_fire_signs_matched_tip_and_records_pending(self):
+        e, st = _arm_entry(), self._st()
+        out = _capture(ex._fire_same_block, e, _sig(e, tip_wei=3376432), st)
+        self.assertEqual(self.sent, ["0xsigned_7_3376432"])    # nonce 7, tip matched to the wei
+        self.assertEqual(st["fires"], 1)
+        self.assertGreater(st["gas_usd"], 0.0)
+        rec = st["sent"][e["key"]]
+        self.assertEqual(rec["status"], "pending")             # handed to _check_pending
+        self.assertEqual(rec["tx"], "0x" + "cd" * 32)
+        f = _fields([ln for ln in _mp_lines(out) if "event=live_fire" in ln][0])
+        self.assertEqual(f["tip_wei"], "3376432")
+        self.assertTrue(f["txh"].startswith("0x"))
+
+    def test_nonce_burned_blocks_fire(self):
+        e, st = _arm_entry(fires_at_sign=0), self._st()
+        st["fires"] = 3                                         # a fire happened since arming
+        ex._fire_same_block(e, _sig(e), st)
+        self.assertEqual(self.sent, [])
+
+    def test_stale_entry_never_fires(self):
+        e, st = _arm_entry(age=ex.ARM_QUOTE_TTL + 1), self._st()
+        ex._fire_same_block(e, _sig(e), st)
+        self.assertEqual(self.sent, [])
+
+    def test_send_failure_refunds(self):
+        def boom(raw, timeout=8.0):
+            raise RuntimeError("write down")
+        ex._mempool_send_raw = boom
+        e, st = _arm_entry(), self._st()
+        self.assertFalse(ex._fire_same_block(e, _sig(e), st))
+        self.assertEqual(st["fires"], 0)                       # refunded, next-block untainted
+        self.assertEqual(st["gas_usd"], 0.0)
+        self.assertEqual(st["sent"], {})                       # no cooldown record
+
+    def test_fee_bid_ticket_not_same_block_fired(self):
+        ex.FEE_BID = True
+        e, st = _arm_entry(blind=False, bid_gwei=5.0), self._st()
+        out = _capture(ex._fire_same_block, e, _sig(e, tip_wei=3376432), st)
+        self.assertEqual(self.sent, [])
+        self.assertIn("live_skip", [_fields(ln)["event"] for ln in _mp_lines(out)])
+        self.assertEqual(st["fires"], 0)
+
+    def test_non_blind_kept_for_preflight_not_fired(self):
+        # a matched tip above the ceiling is non-blind -> preflight would read the pre-reprice
+        # price and revert 'healthy', so we do NOT same-block fire it
+        e, st = _arm_entry(blind=True), self._st()
+        out = _capture(ex._fire_same_block, e, _sig(e, tip_wei=int(0.9 * 1e9)), st)
+        self.assertEqual(self.sent, [])
+        f = [_fields(ln) for ln in _mp_lines(out) if "event=live_skip" in ln][0]
+        self.assertEqual(f["reason"], "needs_preflight")
+
+    def test_guard_trip_raises(self):
+        e = _arm_entry()
+        st = self._st()
+        st["consec_reverts"] = ex.MAX_CONSEC_REVERTS
+        with self.assertRaises(ex.GuardTripped):
+            ex._fire_same_block(e, _sig(e), st)
+        self.assertEqual(self.sent, [])
+
+    def test_claim_burns_nonce_for_next_block_path(self):
+        # after a same-block fire claims the nonce, the next-block _fire_fast must abort on the
+        # same entry (fires_at_sign no longer matches st['fires'])
+        e, st = _arm_entry(), self._st()
+        ex._fire_same_block(e, _sig(e), st)
+        # _fire_fast sees the entry's fires_at_sign (-1) != st['fires'] (1) -> no double-spend
+        self.assertNotEqual(e["fires_at_sign"], st["fires"])
+
+
+class TestMempoolResolve(unittest.TestCase):
+    def test_landed_line_emitted(self):
+        sig = OracleSignal(tx_hash="0x" + "ef" * 32, frm=None, to=None, market_ids=set(),
+                           tip_wei=1, detect_mono=0.0, detect_wall=0.0, head_block=500,
+                           head_age_ms=20.0, landed_block=501)
+        f = _fields(_mp_lines(_capture(ex._mempool_resolve, sig))[0])
+        self.assertEqual(f["event"], "landed")
+        self.assertEqual(f["landed_block"], "501")
+        self.assertEqual(f["detect_head"], "500")
+        self.assertEqual(f["blocks_after"], "1")
+
+    def test_unresolved_landed_line(self):
+        sig = OracleSignal(tx_hash="0x" + "ef" * 32, frm=None, to=None, market_ids=set(),
+                           tip_wei=1, detect_mono=0.0, detect_wall=0.0, head_block=500,
+                           head_age_ms=20.0, landed_block=None)
+        f = _fields(_mp_lines(_capture(ex._mempool_resolve, sig))[0])
+        self.assertEqual(f["landed_block"], "-")
+        self.assertEqual(f["blocks_after"], "-")
 
 
 if __name__ == "__main__":
