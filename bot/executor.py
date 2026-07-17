@@ -55,7 +55,8 @@ Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFI
   KT_PREDICT_SHADOW (1) — default ON: measure lead-time/FP, log PREDICT lines, no pre-arm,
   KT_PREDICT_LIVE (0) — real pre-arm (needs SHADOW=0), still never fires on its own,
   KT_PREDICT_ARM_PCT (0.0045) / KT_PREDICT_DISARM_PCT (0.0035) — arm/retrace hysteresis on
-  |return| from the anchor, KT_PREDICT_FALSEPOS_WINDOW (90) — stuck-arm FP timeout (s),
+  |return| from the anchor, KT_PREDICT_HOLD_SEC (600) — last-resort release when a still-deviated
+  arm never sees a push (must exceed the push lead p90; arms persist, release is retrace-driven),
   KT_PREDICT_ARM_HF (1.006) / KT_PREDICT_ARM_MAX_N (8) — widened arm ceiling/cap for a live-
   pre-armed feed's markets, KT_PREDICT_POLL_SEC (2) — aggregator latestRoundData push poll,
   KT_PREDICT_WS_URL (wss://stream.binance.com:9443/ws) / KT_PREDICT_SYMBOLS (BTCUSDT,ETHUSDT),
@@ -253,7 +254,12 @@ PREDICT_SHADOW = os.environ.get("KT_PREDICT_SHADOW", "1") != "0"      # default 
 PREDICT_LIVE = os.environ.get("KT_PREDICT_LIVE", "0") == "1"          # real pre-arm (never fires)
 PREDICT_ARM_PCT = float(os.environ.get("KT_PREDICT_ARM_PCT", "0.0045"))     # arm at |return| >=
 PREDICT_DISARM_PCT = float(os.environ.get("KT_PREDICT_DISARM_PCT", "0.0035"))  # retrace hysteresis
-PREDICT_FALSEPOS_WINDOW = float(os.environ.get("KT_PREDICT_FALSEPOS_WINDOW", "90"))  # stuck-FP (s)
+# Hold cap: an arm persists while deviated (release is disarm-on-retrace); this is only the last-
+# resort release when the price holds deviated but NO push comes. Must exceed the push lead
+# (research p90 132s BTC / 325s ETH), so 600s — a 90s cap wrongly cleared slow-build true positives
+# and would prematurely release the LIVE pre-arm. Old KT_PREDICT_FALSEPOS_WINDOW kept as an alias.
+PREDICT_HOLD_SEC = float(os.environ.get("KT_PREDICT_HOLD_SEC",
+                         os.environ.get("KT_PREDICT_FALSEPOS_WINDOW", "600")))
 # When a feed is LIVE-pre-armed, widen the arm ceiling for ITS markets from KT_ARM_HF to this (a
 # ~0.5% oracle move can flip a position sitting up to ~this HF) and raise the arm cap so the
 # near-line targets are not evicted. Economics/sizing per target are IDENTICAL — only WHICH
@@ -1919,7 +1925,7 @@ def _start_predict(st: dict):
         agg_reader = _PredictAggReader(PREDICT_HTTP_URL, timeout=3.0)
         engine = _pr.PredictEngine(PREDICT_SYMBOLS, arm_pct=PREDICT_ARM_PCT,
                                    disarm_pct=PREDICT_DISARM_PCT,
-                                   falsepos_window=PREDICT_FALSEPOS_WINDOW)
+                                   falsepos_window=PREDICT_HOLD_SEC)
         driver = _pr.PredictDriver(engine, mid_fn=feed.mid,
                                    poll_fn=lambda: _predict_poll_pushes(agg_reader),
                                    on_arm=_predict_on_arm, interval=PREDICT_INTERVAL_SEC,

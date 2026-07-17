@@ -22,7 +22,7 @@ class _Clock:
         return self.t
 
 
-def _engine(arm=0.0045, disarm=0.0035, window=90.0, clock=None):
+def _engine(arm=0.0045, disarm=0.0035, window=pr.HOLD_SEC, clock=None):
     clock = clock or _Clock()
     return pr.PredictEngine(("BTCUSDT", "ETHUSDT"), arm_pct=arm, disarm_pct=disarm,
                             falsepos_window=window, now=clock.now), clock
@@ -130,23 +130,61 @@ class TestConfirmedAndAnchorReset(unittest.TestCase):
         self.assertEqual(e.feeds["BTCUSDT"].anchor, 1500.0)
 
 
-class TestFalsePositiveWindow(unittest.TestCase):
-    def test_stuck_arm_times_out_and_suppresses(self):
-        e, clock = _engine(arm=0.0045, disarm=0.0035, window=90.0)
+class TestHoldCap(unittest.TestCase):
+    def test_default_hold_cap_is_600(self):
+        # the cap MUST exceed the measured push lead (p90 132s BTC / 325s ETH) so a slow-build
+        # true positive is never wrongly cleared/mislabelled — a 90s cap did exactly that.
+        self.assertEqual(pr.HOLD_SEC, 600.0)
+        self.assertEqual(pr.PredictEngine(("BTCUSDT",)).falsepos_window, 600.0)  # default cap
+
+    def test_slow_build_persists_past_90s_then_confirms(self):
+        # regression for the live bug: ETH armed at -0.456%, stayed deviated, push came ~125s
+        # later. With the 90s cap it was cleared+mislabelled falsepos and the push logged
+        # was_armed=0. With the 600s cap it must PERSIST and register the push as confirmed.
+        e, clock = _engine()                                  # default 600s cap
+        e.bootstrap("ETHUSDT", 2000.0)
+        armev = e.on_mid("ETHUSDT", 1990.8)                   # -0.46% -> arm at t=0
+        self.assertEqual(armev[0]["event"], "arm")
+        clock.t += 95                                         # 95s later, still deviated...
+        e.on_mid("ETHUSDT", 1989.2)                           # -0.54%, never retraced
+        self.assertEqual(e.tick(), [])                        # NOT falsepos (past 90, under cap)
+        self.assertTrue(e.feeds["ETHUSDT"].armed)             # arm still held
+        clock.t += 30                                         # push arrives at t=125s
+        evs = e.on_push("ETHUSDT", price=1989.0)
+        self.assertEqual(evs[0]["event"], "confirmed")
+        self.assertTrue(evs[0]["was_armed"])                  # recall CREDITED, not was_armed=0
+        self.assertAlmostEqual(evs[0]["lead_s"], 125.0)       # full slow-build lead measured
+
+    def test_falsepos_only_at_generous_cap_then_suppresses(self):
+        # a still-deviated arm with NO push past the cap IS a real Binance-vs-median disagreement
+        e, clock = _engine(window=600.0)
         e.bootstrap("BTCUSDT", 1000.0)
         e.on_mid("BTCUSDT", 1006.0)                           # arm
-        self.assertEqual(e.tick(), [])                        # not yet past window
-        clock.t += 91
-        e.on_mid("BTCUSDT", 1006.0)                           # still elevated (no retrace)
+        clock.t += 500
+        e.on_mid("BTCUSDT", 1006.0)                           # still deviated at 500s
+        self.assertEqual(e.tick(), [])                        # under the 600s cap -> hold
+        self.assertTrue(e.feeds["BTCUSDT"].armed)
+        clock.t += 101                                        # now past 600s, still no push
+        e.on_mid("BTCUSDT", 1006.0)
         evs = e.tick()
         self.assertEqual(evs[0]["event"], "falsepos")
-        self.assertGreaterEqual(evs[0]["held_s"], 90.0)
+        self.assertGreaterEqual(evs[0]["held_s"], 600.0)
         self.assertFalse(e.feeds["BTCUSDT"].armed)
         # suppressed: still-elevated mid must NOT immediately re-arm
         self.assertEqual(e.on_mid("BTCUSDT", 1006.0), [])
         # a retrace below the band clears suppression, then a fresh cross re-arms
         self.assertEqual(e.on_mid("BTCUSDT", 1002.0), [])     # clears suppression, no event
         self.assertEqual(len(e.on_mid("BTCUSDT", 1006.0)), 1)  # re-arms
+
+    def test_disarm_on_retrace_is_unchanged(self):
+        # release-on-retrace (hysteresis) is the NORMAL path and must be untouched by the cap fix
+        e, clock = _engine()                                  # default 600s cap
+        e.bootstrap("BTCUSDT", 1000.0)
+        e.on_mid("BTCUSDT", 1006.0)                           # arm
+        clock.t += 10
+        evs = e.on_mid("BTCUSDT", 1003.0)                     # retrace below 0.35% -> disarm
+        self.assertEqual(evs[0]["event"], "disarm")
+        self.assertFalse(e.feeds["BTCUSDT"].armed)
 
 
 class TestFormatGrammar(unittest.TestCase):

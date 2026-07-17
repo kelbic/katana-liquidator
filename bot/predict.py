@@ -13,9 +13,12 @@ MODEL: Chainlink pushes when |binance_mid - last_onchain| / last_onchain >= ~0.5
 Per feed we hold an ANCHOR = the on-chain price at the last push, and continuously compute
 return = (binance_mid - anchor)/anchor. We ARM at |return| >= KT_PREDICT_ARM_PCT (default 0.45%,
 just below the 0.5% trigger, to buy lead) and DISARM on a retrace below KT_PREDICT_DISARM_PCT
-(0.35%, a hysteresis band) with no push. On a confirmed push we reset the anchor to the current
-Binance mid (which ≈ the freshly-pushed value → return ≈ 0). An arm that never sees a push is a
-false positive (retrace => `disarm`; stuck-elevated past the window => `falsepos`).
+(0.35%, a hysteresis band) with no push. An arm PERSISTS while the price stays deviated — it is
+released ONLY on a genuine retrace (disarm), never on a timer, because a real push can lag by
+minutes (research lead p90 = 132s BTC / 325s ETH). On a confirmed push we reset the anchor to the
+current Binance mid (which ≈ the freshly-pushed value → return ≈ 0). An arm that never sees a push
+is a false positive (retrace => `disarm`; held deviated past the generous KT_PREDICT_HOLD_SEC cap
+with no push => `falsepos`).
 
   PredictEngine  — pure state machine (this module's core; unit-tested offline, no I/O).
   PredictDriver  — daemon-thread orchestrator: reads the PriceFeed mid snapshot + polls the
@@ -34,8 +37,9 @@ PREDICT shadow-log grammar (greppable; `PREDICT ` + space-separated key=value, `
                                                    recall miss / sub-threshold move). lead_s = -.
   event=disarm     feed held_s ret_pct peak_ret_pct              — armed → retraced below the
                                                    hysteresis band, no push (false positive).
-  event=falsepos   feed held_s ret_pct peak_ret_pct              — armed, held past FALSEPOS_
-                                                   WINDOW with no push and no retrace (stuck FP).
+  event=falsepos   feed held_s ret_pct peak_ret_pct              — armed, held DEVIATED past the
+                                                   KT_PREDICT_HOLD_SEC cap (600s) with no push and
+                                                   no retrace (real Binance-vs-median disagreement).
   event=prearm     feed markets n                — (LIVE) published N market(s) for widened arm.
   event=prearm_clear feed                        — (LIVE) cleared a feed's widened-arm markets.
 Analyzer notes: FP rate = (disarm + falsepos) / arm; recall = confirmed / (confirmed + push);
@@ -58,7 +62,12 @@ FEED_LABEL: dict[str, str] = {"BTC/USD": "BTC", "ETH/USD": "ETH"}
 
 ARM_PCT = 0.0045
 DISARM_PCT = 0.0035
-FALSEPOS_WINDOW = 90.0
+# Hold cap: an arm PERSISTS while the price stays deviated (>= DISARM_PCT) and is released only on
+# a genuine retrace (disarm) — NOT on a timer. This cap is the last-resort release when the price
+# stays deviated but no push ever comes (a real Binance-vs-Chainlink-median disagreement). It must
+# comfortably exceed the measured push lead (research p90 = 132s BTC / 325s ETH; a 90s cap wrongly
+# cleared genuine slow-build true positives and mislabelled them falsepos), hence 600s default.
+HOLD_SEC = 600.0
 
 
 def markets_for_symbol(symbol: str) -> set[str]:
@@ -103,7 +112,7 @@ class PredictEngine:
     method returns a list of event dicts (never logs, never does I/O). `now` is injectable."""
 
     def __init__(self, symbols=("BTCUSDT", "ETHUSDT"), arm_pct: float = ARM_PCT,
-                 disarm_pct: float = DISARM_PCT, falsepos_window: float = FALSEPOS_WINDOW,
+                 disarm_pct: float = DISARM_PCT, falsepos_window: float = HOLD_SEC,
                  now=time.monotonic):
         self.arm_pct, self.disarm_pct, self.falsepos_window = arm_pct, disarm_pct, falsepos_window
         self._now = now
@@ -195,9 +204,12 @@ class PredictEngine:
         return events
 
     def tick(self, wall: float | None = None) -> list[dict]:
-        """Time-driven check: an arm held past FALSEPOS_WINDOW with no push and no retrace is a
-        stuck false positive. Disarm + suppress re-arm until a retrace clears it (so we don't
-        arm→falsepos→arm loop while the price sits just above the band)."""
+        """Time-driven LAST-RESORT release. An arm PERSISTS while the price stays deviated — the
+        normal release is disarm-on-retrace (on_mid), never a timer, because a genuine push can
+        lag by minutes (research lead p90 = 132s BTC / 325s ETH). Only when the price has held
+        deviated past the generous HOLD_SEC cap with no push do we give up: a real Binance-vs-
+        Chainlink-median disagreement -> falsepos. Disarm + suppress re-arm until a retrace clears
+        it (so we don't arm→falsepos→arm loop while the price sits just above the band)."""
         events: list[dict] = []
         for f in self.feeds.values():
             if f.armed and f.arm_mono is not None and \
