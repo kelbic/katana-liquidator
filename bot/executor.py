@@ -81,7 +81,7 @@ from analysis.keccak import selector                                   # noqa: E
 from analysis.models import lif_from_lltv                              # noqa: E402
 from analysis.monitor import scan, load_state as load_monitor_state    # noqa: E402
 from analysis.multicall import MULTICALL3                              # noqa: E402
-from analysis.protocols import MORPHO, STABLES, TOKENS                 # noqa: E402
+from analysis.protocols import MARKETS, MORPHO, STABLES, TOKENS        # noqa: E402
 from analysis.rpc import DEFAULT_RPCS, Rpc                             # noqa: E402
 from bot import fastpath                                               # noqa: E402
 from bot import oracles                                               # noqa: E402
@@ -103,6 +103,13 @@ READ_RPCS = [os.environ["KT_READ_RPC"]] if os.environ.get("KT_READ_RPC") else No
 
 MIN_PROFIT_USD = float(os.environ.get("KT_MIN_PROFIT_USD", "20"))
 MIN_DEBT_USD = float(os.environ.get("KT_MIN_DEBT_USD", "500"))
+# Competitor-race telemetry: EVERY race a competitor won is LOGGED (with its on-the-table prize
+# + a why-we-weren't-in-it tag), but only races worth our attention PING Telegram — the quiet
+# mode. Default alert floor = the profit floor (a race whose bonus is below it we'd never
+# contest). Unpriceable races fail OPEN (still alert). RACE_ALERT_MAX caps pings per pass so a
+# cascade of above-floor races can't firehose TG.
+RACE_ALERT_MIN_USD = float(os.environ.get("KT_RACE_ALERT_MIN_USD", str(MIN_PROFIT_USD)))
+RACE_ALERT_MAX = int(os.environ.get("KT_RACE_ALERT_MAX", "5"))
 MAX_SLIPPAGE = float(os.environ.get("KT_MAX_SLIPPAGE", "0.008"))   # swap floor sent to Sushi
 MAX_IMPACT = float(os.environ.get("KT_MAX_IMPACT", "0.02"))        # chunk if impact above this
 POLL_SEC = int(os.environ.get("KT_POLL_SEC", "20"))         # cadence when NOTHING is near-edge
@@ -367,6 +374,43 @@ def _loan_usd_px(addr: str) -> float | None:
     if a in _ETH_LIKE:
         return ETH_USD
     return None
+
+
+# --- competitor-race prize (the on-the-table bonus of a race we did NOT win) ----------------
+_MARKET_BY_ID = {m["id"].lower(): m for m in MARKETS.values()}
+_SYM_TOKEN = {sym: tok for sym, tok in TOKENS.items()}
+
+
+def _race_bonus_usd(lq: dict) -> float | None:
+    """USD prize a competitor's Liquidate left on the table: seized_value - repaid_value. In a
+    Morpho close seized_value == repaid_value * LIF, so this is (LIF-1) * repaid_usd — the same
+    conversion the bot uses for a target's bonus (models.morpho_bonus_usd), needing only the
+    LOAN price (which we have for our markets) + the market LIF. Returns None (fail OPEN — the
+    caller still alerts) when the market isn't in our registry or the loan can't be priced;
+    NO RPC in this path (uses the market config + the cached loan price)."""
+    mkt = _MARKET_BY_ID.get((lq.get("market_id") or "").lower())
+    if not mkt:
+        return None
+    tok = _SYM_TOKEN.get(mkt["loan"])
+    if not tok:
+        return None
+    loan_px = _loan_usd_px(tok["address"])
+    if loan_px is None:
+        return None
+    repaid_usd = lq.get("repaid_assets", 0) / 10 ** tok["decimals"] * loan_px
+    lif = lif_from_lltv(int(round(mkt["lltv"] * 10 ** 18)))
+    return (lif - 1.0) * repaid_usd
+
+
+def _race_reason(lq: dict, bonus_usd: float | None, tracked: set[str]) -> str:
+    """Cheap 'why we weren't in it' tag from data in hand (no RPC): a dust prize below our floor
+    (below_floor), else a borrower we were watching (tracked_lost — a real miss) or one we never
+    had in the book (not_tracked)."""
+    if bonus_usd is not None and bonus_usd < MIN_PROFIT_USD:
+        return "below_floor"
+    if (lq.get("borrower") or "").lower() in tracked:
+        return "tracked_lost"
+    return "not_tracked"
 
 
 def refresh_eth_usd() -> None:
@@ -1409,20 +1453,32 @@ def once(st: dict | None = None, mstate: dict | None = None,
     st["passes"] += 1
 
     # race telemetry (review M8): real Liquidate events (KT_LIQ_LOG_WINDOW>0) not sent by us =
-    # a race we lost or never saw — THE metric hot-poll exists to move.
+    # a race we lost or never saw — THE metric hot-poll exists to move. EVERY such race is logged
+    # (with its on-the-table prize + a why-we-weren't-in-it tag); only races worth our attention
+    # ping Telegram (quiet mode: KT_RACE_ALERT_MIN_USD, default the profit floor). Unpriceable
+    # races fail OPEN (still alert). All races are still logged + still feed races_lost unchanged.
     if r["liquidations"]:
         if "last_liq_block" not in st:
             st["last_liq_block"] = r["block"]     # first sight: don't replay history
         ours = CONTRACT.lower()
+        tracked = {(row.get("borrower") or "").lower()
+                   for row in r["targets"] + r["risk"]}
+        alerts_left = RACE_ALERT_MAX
         for lq in r["liquidations"]:
             if lq["block"] <= st["last_liq_block"]:
                 continue
             if lq["liquidator"] != ours:
-                msg = (f"🏁 RACE: {lq['borrower'][:10]}… liquidated by {lq['liquidator'][:10]}… "
-                       f"repaid={lq['repaid_assets']} seized={lq['seized_assets']} "
-                       f"blk={lq['block']}")
-                print(f"  {msg}")
-                alert(msg)
+                bonus = _race_bonus_usd(lq)
+                reason = _race_reason(lq, bonus, tracked)
+                prize = f"~${bonus:,.2f}" if bonus is not None else "~$?"
+                msg = (f"🏁 RACE {prize} [{reason}] {lq['borrower'][:10]}…→"
+                       f"{lq['liquidator'][:10]}… repaid={lq['repaid_assets']} "
+                       f"seized={lq['seized_assets']} blk={lq['block']}")
+                print(f"  {msg}")                 # ALWAYS log — dust races included
+                # alert only when the prize is unknown (fail open) or worth our attention
+                if (bonus is None or bonus >= RACE_ALERT_MIN_USD) and alerts_left > 0:
+                    alert(msg)
+                    alerts_left -= 1
         st["last_liq_block"] = max(st["last_liq_block"],
                                    max(lq["block"] for lq in r["liquidations"]))
 

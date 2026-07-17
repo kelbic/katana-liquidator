@@ -13,6 +13,7 @@ os.environ.setdefault("KT_MIN_PROFIT_USD", "20")
 os.environ.setdefault("KT_MAX_IMPACT", "0.02")
 os.environ.setdefault("KT_CONTRACT", "0x000000000000000000000000000000000000bEEF")
 
+from analysis.protocols import MARKETS  # noqa: E402
 from bot import executor as ex  # noqa: E402
 from bot.mempool import OracleSignal  # noqa: E402
 
@@ -1247,6 +1248,114 @@ class TestMempoolResolve(unittest.TestCase):
         f = _fields(_mp_lines(_capture(ex._mempool_resolve, sig))[0])
         self.assertEqual(f["landed_block"], "-")
         self.assertEqual(f["blocks_after"], "-")
+
+
+def _liq(market_id, repaid_assets, seized_assets=0, block=1000,
+         borrower="0x" + "14" * 20, liquidator="0x" + "99" * 20):
+    return {"protocol": "morpho", "block": block, "tx": "0x" + "aa" * 32,
+            "market_id": market_id, "liquidator": liquidator.lower(),
+            "borrower": borrower.lower(), "repaid_assets": repaid_assets,
+            "repaid_shares": 0, "seized_assets": seized_assets, "bad_debt_assets": 0}
+
+
+class TestRaceBonus(unittest.TestCase):
+    WBTC_USDC = MARKETS["vbWBTC/vbUSDC"]["id"]                # loan vbUSDC (6dec), lltv 0.86
+
+    def test_stable_market_bonus_is_lif_minus_one_times_repaid(self):
+        lq = _liq(self.WBTC_USDC, repaid_assets=int(5.30 * 1e6))   # $5.30 repaid
+        bonus = ex._race_bonus_usd(lq)
+        lif = ex.lif_from_lltv(int(round(0.86 * 1e18)))
+        self.assertAlmostEqual(bonus, (lif - 1.0) * 5.30, places=4)
+        self.assertLess(bonus, ex.MIN_PROFIT_USD)                  # dust — the quiet-mode case
+
+    def test_unknown_market_fails_open(self):
+        self.assertIsNone(ex._race_bonus_usd(_liq("0x" + "99" * 32, 1_000_000)))
+
+    def test_reason_tags(self):
+        lq = _liq(self.WBTC_USDC, int(5.30 * 1e6))
+        self.assertEqual(ex._race_reason(lq, 0.23, set()), "below_floor")
+        tracked = {lq["borrower"]}
+        self.assertEqual(ex._race_reason(lq, 100.0, tracked), "tracked_lost")
+        self.assertEqual(ex._race_reason(lq, 100.0, set()), "not_tracked")
+        # unpriceable + tracked -> tracked_lost (not below_floor, bonus unknown)
+        self.assertEqual(ex._race_reason(lq, None, tracked), "tracked_lost")
+
+
+class TestRaceTelemetryAlerts(unittest.TestCase):
+    """EVERY race logs; only races worth attention (or unpriceable -> fail open) ping TG."""
+    WBTC_USDC = MARKETS["vbWBTC/vbUSDC"]["id"]
+
+    def setUp(self):
+        self._save = (ex.scan, ex.gas_cost_usd, ex.alert, ex.DRY_RUN, ex.CONTRACT,
+                      ex.RACE_ALERT_MIN_USD)
+        ex.DRY_RUN = True
+        ex.CONTRACT = "0x" + "be" * 20
+        ex.gas_cost_usd = lambda rpc: 0.0
+        ex.RACE_ALERT_MIN_USD = 20.0
+        self.alerts = []
+        ex.alert = lambda text, sync=False: self.alerts.append(text)
+
+    def tearDown(self):
+        (ex.scan, ex.gas_cost_usd, ex.alert, ex.DRY_RUN, ex.CONTRACT,
+         ex.RACE_ALERT_MIN_USD) = self._save
+
+    def _run(self, liq, risk=None):
+        def fake_scan(rpc, mstate, **kw):
+            return {"block": 1000, "targets": [], "risk": risk or [], "n_positions": 0,
+                    "liquidations": [liq], "state": {}}
+        ex.scan = fake_scan
+        st = {"day": "", "gas_usd": 0.0, "consec_reverts": 0, "sent": {}, "declined": {},
+              "last_heartbeat": 0, "passes": 0, "fires": 0, "reverts": 0, "races_lost": 0,
+              "last_liq_block": 999}                            # so a block-1000 race is fresh
+        out = _capture(ex.once, st, {}, skip_api=True)
+        return st, out
+
+    def _race_log(self, out):
+        return [ln for ln in out.splitlines() if "🏁 RACE" in ln]
+
+    def test_below_floor_logs_but_no_alert(self):
+        _, out = self._run(_liq(self.WBTC_USDC, int(5.30 * 1e6)))   # ~$0.23 bonus < $20
+        self.assertEqual(len(self._race_log(out)), 1)              # logged
+        self.assertIn("[below_floor]", self._race_log(out)[0])
+        self.assertEqual(self.alerts, [])                          # NOT alerted (quiet mode)
+
+    def test_above_floor_alerts(self):
+        _, out = self._run(_liq(self.WBTC_USDC, int(1000.0 * 1e6)))  # ~$43.8 bonus >= $20
+        self.assertEqual(len(self._race_log(out)), 1)
+        self.assertEqual(len(self.alerts), 1)
+        self.assertIn("🏁 RACE", self.alerts[0])
+
+    def test_unpriceable_race_fails_open_and_alerts(self):
+        _, out = self._run(_liq("0x" + "99" * 32, 1_000_000))      # market not in registry
+        self.assertEqual(len(self._race_log(out)), 1)
+        self.assertIn("~$?", self._race_log(out)[0])
+        self.assertEqual(len(self.alerts), 1)                      # fail open -> still pings
+
+    def test_tracked_lost_tag_when_borrower_in_book(self):
+        b = "0x" + "22" * 20
+        risk = [{"borrower": b, "hf": 1.01}]
+        _, out = self._run(_liq(self.WBTC_USDC, int(1000.0 * 1e6), borrower=b), risk=risk)
+        self.assertIn("[tracked_lost]", self._race_log(out)[0])
+
+    def test_alert_cap_bounds_pings(self):
+        save = ex.RACE_ALERT_MAX
+        ex.RACE_ALERT_MAX = 2
+
+        def fake_scan(rpc, mstate, **kw):
+            liqs = [_liq(self.WBTC_USDC, int(1000.0 * 1e6), block=1000,
+                         borrower="0x" + f"{i:02x}" * 20) for i in range(5)]
+            return {"block": 1000, "targets": [], "risk": [], "n_positions": 0,
+                    "liquidations": liqs, "state": {}}
+        ex.scan = fake_scan
+        st = {"day": "", "gas_usd": 0.0, "consec_reverts": 0, "sent": {}, "declined": {},
+              "last_heartbeat": 0, "passes": 0, "fires": 0, "reverts": 0, "races_lost": 0,
+              "last_liq_block": 999}
+        try:
+            out = _capture(ex.once, st, {}, skip_api=True)
+        finally:
+            ex.RACE_ALERT_MAX = save
+        self.assertEqual(len(self._race_log(out)), 5)             # all 5 LOGGED
+        self.assertEqual(len(self.alerts), 2)                     # capped pings
 
 
 if __name__ == "__main__":
