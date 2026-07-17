@@ -185,6 +185,14 @@ BLIND_FIRE = os.environ.get("KT_BLIND_FIRE", "1") == "1"
 # dedup so the REMAINDER of a chunked close is re-taken immediately instead of gifted for 5min.
 QUOTE_TIMEOUT = float(os.environ.get("KT_QUOTE_TIMEOUT", "5"))
 QUOTE_RETRIES = int(os.environ.get("KT_QUOTE_RETRIES", "2"))
+# Arm path only: never START a Sushi quote that can't finish inside the REMAINING idle-zone
+# budget. A pre-arm quote runs inside the idle zone with a hard deadline_mono; the classic
+# 5s QUOTE_TIMEOUT let a slow/Partial quote (the weETH/vbETH cluster returns Partial routes
+# often) overrun the boundary and eat the armed window — the "evaluate deadline exceeded,
+# giving up this pass" storm. evaluate() caps each arm-path quote's timeout to the budget left
+# and takes a single shot; if less than this floor remains, it stops rather than start a doomed
+# round-trip. The classic (deadline_mono=None) path is unchanged.
+QUOTE_MIN_TIMEOUT = float(os.environ.get("KT_QUOTE_MIN_TIMEOUT", "0.35"))
 EVAL_DEADLINE_SEC = float(os.environ.get("KT_EVAL_DEADLINE_SEC", "10"))
 RECEIPT_WAIT_SEC = float(os.environ.get("KT_RECEIPT_WAIT_SEC", "20"))
 DEDUP_OK_SEC = float(os.environ.get("KT_DEDUP_OK_SEC", "10"))
@@ -383,11 +391,21 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = No
         else:
             seized_arg = 0
             amount_in = seized * _HAIRCUT_NUM // _HAIRCUT_DEN
+        # arm path (deadline_mono set): cap the quote timeout to the idle budget left and take
+        # ONE shot, so a slow/Partial quote can never outlive the armed window. Classic path
+        # (deadline_mono is None) keeps the full QUOTE_TIMEOUT + QUOTE_RETRIES.
+        q_timeout, q_retries = QUOTE_TIMEOUT, QUOTE_RETRIES
+        if deadline_mono is not None:
+            remaining = deadline - time.monotonic()
+            if remaining < QUOTE_MIN_TIMEOUT:
+                print("    evaluate: idle budget below one quote — not starting another")
+                break
+            q_timeout, q_retries = min(QUOTE_TIMEOUT, remaining), 1
         try:
             q = quote(coll, loan, amount_in,
                       sender=CONTRACT or "0x000000000000000000000000000000000000dEaD",
                       recipient=CONTRACT or "0x000000000000000000000000000000000000dEaD",
-                      max_slippage=MAX_SLIPPAGE, timeout=QUOTE_TIMEOUT, retries=QUOTE_RETRIES)
+                      max_slippage=MAX_SLIPPAGE, timeout=q_timeout, retries=q_retries)
         except NoRouteError:
             # no route at any size (dead/exotic collateral, e.g. yUSD) — skip this target
             return None

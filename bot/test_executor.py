@@ -131,6 +131,66 @@ class TestEvaluate(unittest.TestCase):
         self.assertLessEqual(ev["repaid_shares"], shares)
 
 
+class TestArmQuoteTimeoutCap(unittest.TestCase):
+    """Small fix: an arm-path quote (deadline_mono set) must cap its Sushi timeout to the
+    REMAINING idle budget and single-shot it, so a slow/Partial quote can't eat the armed
+    window. The classic path (deadline_mono=None) keeps the full QUOTE_TIMEOUT + retries."""
+
+    def setUp(self):
+        self._orig = ex.quote
+
+    def tearDown(self):
+        ex.quote = self._orig
+
+    def test_arm_quote_timeout_capped_to_remaining_budget(self):
+        seen = {}
+
+        def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005,
+              timeout=5.0, retries=2):
+            seen["timeout"] = timeout
+            seen["retries"] = retries
+            out = int(amount_in_wei / 1e8 * 61500 * 1e6)
+            return {"amount_out": out, "price_impact": 0.008, "gas": 400000,
+                    "swap_target": "0x" + "ac" * 20, "swap_calldata": "0xbeef"}
+        ex.quote = q
+        t = _target(1.0, 61000.0)
+        # ~0.5s of idle budget left -> the quote must be capped at <= 0.5s and single-shot
+        ex.evaluate(None, t, gas_usd=0.01, deadline_mono=time.monotonic() + 0.5)
+        self.assertLessEqual(seen["timeout"], 0.5 + 1e-6)
+        self.assertGreater(seen["timeout"], 0.0)
+        self.assertEqual(seen["retries"], 1)
+
+    def test_classic_path_uses_full_timeout(self):
+        seen = {}
+
+        def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005,
+              timeout=5.0, retries=2):
+            seen["timeout"] = timeout
+            seen["retries"] = retries
+            out = int(amount_in_wei / 1e8 * 61500 * 1e6)
+            return {"amount_out": out, "price_impact": 0.008, "gas": 400000,
+                    "swap_target": "0x" + "ac" * 20, "swap_calldata": "0xbeef"}
+        ex.quote = q
+        t = _target(1.0, 61000.0)
+        ex.evaluate(None, t, gas_usd=0.01)                    # no deadline_mono -> classic
+        self.assertEqual(seen["timeout"], ex.QUOTE_TIMEOUT)
+        self.assertEqual(seen["retries"], ex.QUOTE_RETRIES)
+
+    def test_no_quote_started_when_budget_below_floor(self):
+        calls = {"n": 0}
+
+        def q(*a, **k):
+            calls["n"] += 1
+            raise AssertionError("must not start a quote below the min-timeout floor")
+        ex.quote = q
+        t = _target(1.0, 61000.0)
+        # budget already inside the floor -> stop before any network round-trip
+        ev = ex.evaluate(None, t, gas_usd=0.01,
+                         deadline_mono=time.monotonic() + ex.QUOTE_MIN_TIMEOUT / 2)
+        self.assertIsNone(ev)
+        self.assertEqual(calls["n"], 0)
+
+
 class TestCalldata(unittest.TestCase):
     def test_selector_and_wellformed(self):
         t = _target()
@@ -570,7 +630,8 @@ class TestArmRefresh(unittest.TestCase):
         self.assertEqual(ex._arm, {})
 
     def test_evaluate_deadline_cap_blocks_further_quotes(self):
-        # arm path: a spent idle budget must never start another Sushi round-trip
+        # arm path: a budget below one quote's floor must never start a Sushi round-trip that
+        # can't finish inside the armed window (the small fix — a 5ms budget can't fit a quote)
         calls = {"n": 0}
 
         def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005, **kw):
@@ -583,7 +644,7 @@ class TestArmRefresh(unittest.TestCase):
         t = _target(1.0, 61000.0)
         ev = ex.evaluate(None, t, gas_usd=0.01, deadline_mono=time.monotonic() + 0.005)
         self.assertIsNone(ev)
-        self.assertEqual(calls["n"], 1)                   # stopped after the first quote
+        self.assertEqual(calls["n"], 0)                   # sub-floor budget -> never started
 
     def test_budget_stopped_evaluate_is_not_a_decline(self):
         # evaluate returning None because the BUDGET ran out must NOT skip the target for
