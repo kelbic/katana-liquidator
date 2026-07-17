@@ -336,4 +336,58 @@ shadow это и измерит (budget_ms + landed по факту) ДО вкл
 неизвестен (fail-open) или ≥ `KT_RACE_ALERT_MIN_USD` (дефолт = профит-флор). `KT_RACE_ALERT_MAX`
 кэпит пинги за пасс. Дустовые гонки (репэй ~$5.30, бонус ~$0.23) больше не спамят.
 
-Тесты: 202/202 зелёные (было 134). Экономика/гарды/sizing/kill-switch/Phase-2 не тронуты.
+## v5 — ORACLE-PUSH PREDICTION pre-arm (bot/pricefeed.py + bot/predict.py; `KT_PREDICT`, дефолт OFF)
+
+ИЗМЕРЕНО (2026-07-17): Chainlink BTC/ETH на Katana пушат он-чейн, когда офф-чейн цена (прокси —
+Binance spot) уходит ~0.5% (или 24ч heartbeat). Офф-чейн цена пересекает 0.5% на МЕДИАНУ ~30-40с
+(мин ~13-26с) РАНЬШЕ он-чейн пуша — пуш отстаёт на OCR-раунд+консенсус+tx. Это 60-80x нашего
+mempool-хедстарта (~0.6с). Смотрим Binance, предсказываем пуш → успеваем быть ПОЛНОСТЬЮ pre-armed,
+превращая same-block ПРОИГРЫШИ на быстрых крупных движениях (самые ценные ликвидации) в выигрыши.
+FP ~46% (Binance single-venue шумнее node-медианы Chainlink), recall ~72%.
+
+ПРИНЦИП (нельзя нарушать): предсказание — это edge на ПОДГОТОВКУ, НЕ на обгон. Мы НЕ МОЖЕМ
+выстрелить до он-чейн пуша (позиция не ликвидируема, пока оракул не переоценил он-чейн, а точный
+tip раунда всё равно читается из pending oracle tx в мемпуле). Поэтому предикт-слой НИКОГДА сам
+ничего не шлёт — только PRE-ARM (расширяет pre-signed флип-сет для рынков движущегося фида, греет
+write-линию). Реальный fire — как раньше: v4 mempool-слой на ПОДТВЕРЖДЁННОМ pending oracle tx
+matched-tip и broadcast. Спекулятивный fire на предсказании ЗАПРЕЩЁН (46% FP → реверт/газ впустую).
+- **Binance WS** (`bot/pricefeed.py`): фоновый daemon-поток, персистентный сокет (переиспользует
+  `WsConn`/фрейминг mempool.py) на `wss://stream.binance.com:9443/ws`, in-band SUBSCRIBE обоих
+  `btcusdt@bookTicker`+`ethusdt@bookTicker` (combined `/stream?streams=` НЕ используем — WsConn
+  роняет query-string). Свой lock-снапшот mid + `healthy()`; reconnect с capped backoff. WS упал =
+  предсказаний нет, mempool/fast-path не затронуты. ПРОВЕРЕНО с этого VPS: 101-хэндшейк ~1с, оба
+  символа текут на одном коннекте.
+- **Anchor/return** (`bot/predict.py`, чистый `PredictEngine`): на фид держим anchor = он-чейн цена
+  последнего пуша; return = (binance_mid − anchor)/anchor. ARM при |return| ≥ `KT_PREDICT_ARM_PCT`
+  (0.45%, чуть ниже 0.5% для лида), DISARM на ретрейс < `KT_PREDICT_DISARM_PCT` (0.35%, гистерезис)
+  без пуша. На подтверждённом пуше anchor := текущий binance_mid (return≈0). Bootstrap anchor из
+  он-чейн `latestRoundData` (агрегаторы читаются ПРЯМЫМ eth_call — access-control рубит multicall-
+  вызов от контракта). Пуш детектится по смене `updatedAt` (poll `KT_PREDICT_POLL_SEC`=2с).
+- **Pre-arm** (`KT_PREDICT_LIVE`, дефолт OFF): на ARM фида F `_arm_candidates` расширяет потолок HF
+  для рынков F с `KT_ARM_HF` до `KT_PREDICT_ARM_HF`=1.006 и кап до `KT_PREDICT_ARM_MAX_N`=8 —
+  БОЛЬШЕ pre-signed кандидатов (та же evaluate/экономика на цель, меняется только КАКИЕ армим).
+  Реакция на реальный пуш схлопывается до insert-tip+broadcast. Пустой набор (shadow/off) →
+  `_arm_candidates` байт-в-байт как раньше.
+- **SHADOW дефолт** (`KT_PREDICT_SHADOW=1`): WS+anchor+return+сигнал считаются и ЛОГируются, но НЕ
+  pre-arm/не меняем cadence (только измеряем реальный лид + FP на своём потоке ДО live-pre-arm).
+
+Грамматика shadow-лога (для grep-анализатора; `PREDICT ` + key=value, `-`=нет значения):
+  `event=bootstrap` — feed, anchor, source(onchain): стартовый anchor из он-чейн цены.
+  `event=arm`       — feed, ret_pct(знаковый %), ret_bps(|bps|), anchor, mid, dir(up|down).
+  `event=confirmed` — пуш пришёл ПОКА ARMED: feed, was_armed=1, lead_s(=push_ts−arm_ts, лид!),
+                      ret_pct, arm_ret_pct, anchor, push_mid.
+  `event=push`      — пуш БЕЗ активного arm (recall-мисс/суб-порог): feed, was_armed=0, lead_s=-.
+  `event=disarm`    — armed→ретрейс ниже гистерезис-полосы без пуша (FP): feed, held_s, ret_pct,
+                      peak_ret_pct.
+  `event=falsepos`  — armed, держали дольше `KT_PREDICT_FALSEPOS_WINDOW`=90с без пуша/ретрейса
+                      (stuck FP): feed, held_s, ret_pct, peak_ret_pct.
+  live-only: `event=prearm`(feed,markets,n) / `prearm_clear`(feed) — открыли/закрыли широкий сет.
+Анализ: FP-rate = (disarm+falsepos)/arm; recall = confirmed/(confirmed+push); распределение лида —
+lead_s по `confirmed`. Всё меряется на НАШЕМ live-потоке (валидирует ресёрч ~30-40с/~46% ДО live).
+ЧЕСТНЫЕ ОГОВОРКИ: (1) pre-arm НИКОГДА сам не шлёт — fire только mempool/fast-path на реальном пуше;
+(2) Binance single-venue — прокси node-медианы Chainlink, отсюда ~46% FP (гистерезис их гасит, а
+не firing); (3) WS/RPC down = деградация до текущего поведения, не wedge. `KT_PREDICT` unset = бот
+как сегодня (ни потоков, ни поллов, ни изменения arm).
+
+Тесты: 234/234 зелёные (было 202: +9 pricefeed, +18 predict, +5 executor-prearm). Экономика/гарды/
+sizing/kill-switch/fire-логика/Phase-2 bid — БАЙТ-в-БАЙТ, это только детект/расписание.
