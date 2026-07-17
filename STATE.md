@@ -149,6 +149,7 @@ katana-liquidator/
   bot/
     sushi.py                     Sushi v7 client: quote + RouteProcessor calldata (atomic exit)
     executor.py                  live loop: scan → evaluate(chunk vs live quote) → sign+broadcast
+    fastpath.py                  block-phase lock + flip thresholds for the pre-armed fire (v3)
     deploy.sh run.sh katana-executor.service
 ```
 
@@ -253,3 +254,33 @@ Liquidated теперь несёт seized/repaid; setOwner с zero-check; Deploy
 747474. Бот: LIQUIDATE_SELECTOR 0x79755efe (сверен cast==оффлайн-keccak), evaluate ветвится
 capped/uncapped, _shares_for_repaid без 0.5%-шейва (не нужен). Форк-тесты: 6/6 против
 реального Morpho (вкл. capped-close и dust-sweep); юниты 17/17.
+
+**Update 2026-07-17 — v3 latency: предиктивный детект границы блока + pre-armed fire.**
+Пробы (`~/.katana-probe`, 551 проба): секвенсер включает tx в СЛЕДУЮЩИЙ блок только если она
+ПРИШЛА в ~0.25–0.35с после появления блока N — P(next) 21% @+0.05s, 9–13% @+0.15–0.25s, ~0%
+@≥0.35s; send one-way ~110–150мс. Старый детект (фикс-каденс + холодный urllib) съедал
+0.65–1.05с сам по себе → end-to-end 1.5–2.1с, P(B0+1) ~7–10%. Сделано (3 коммита):
+- **Keep-alive транспорт** (`analysis/rpc.py`): модульный пул персистентных соединений (один
+  сокет на эндпоинт; reconnect-once на протухший LB-сокет ~60с idle), `warm()` перед боевым
+  окном и каждый пасс; `poll_block_number()` — one-shot без пейсинга/ретраев для tight-poll.
+  Тёплый RTT 21–26мс против ~115мс холодного; hot-pass 0.88 → 0.40–0.65с.
+- **Фазовый замок на блок-тик** (`bot/fastpath.py`, `KT_PREDICTIVE_POLL=1` дефолт): idle-зона
+  [t0, t0+0.80с) — ВЕСЬ обслуживающий трафик (hot-pass, квоты, пре-подпись, warm-пинги);
+  armed-зона — tight-poll `eth_blockNumber` каждые ~18мс → детект ≈ step/2+RTT. Якорь только
+  по НАБЛЮДЕННОЙ границе (ошибка ≤ step+RTT, без дрейфа); поздний вход (медленный пасс)
+  поглощается предсказанным якорем (каданс 1.000с, макс 2 подряд); слом паттерна — громкий
+  фолбэк на классический hot-каденс c ресинком.
+- **Pre-armed fire** (`bot/executor.py`): цели с 1 ≤ HF < `KT_ARM_HF`=1.002 (топ-4 по долгу,
+  MIN_DEBT-гейт) готовятся в idle-зоне: живые шары + ТОТ ЖЕ `evaluate()` (экономика байт-в-байт)
+  + calldata + sanity-preflight («position is healthy» обязателен; любой другой реверт = не
+  армить; preflight ПРОШЁЛ = уже флипнулась → классический fire немедленно) + нонс + пре-подпись
+  (свежесть `KT_ARM_QUOTE_TTL`=2.5с). На границе блока: ОДИН заранее собранный aggregate3 по
+  ораклам hot-сета → целочисленный флип-порог (бит-в-бит `_isHealthy`, тест ±1 wei на >2^53) →
+  отправка пре-подписанной raw. **Blind fire ТОЛЬКО на дефолтном типе 0.001 gwei** (проигранная
+  гонка ≈ $0.001); цель с Phase-2 бидом всегда держит preflight в критическом пути (реверт бида
+  сжигает бид); `KT_BLIND_FIRE=0` = preflight для всех. Сожжённый нонс (fires_at_sign) блокирует
+  слепую отправку; фейл fast-send рефандит fires/gas и НЕ кулдаунит цель (классика ретраит ~1с).
+Замерено вживую (DRY_RUN, стейт в памяти): замок держится (межблок 1.000с), detect→flip-check
+p50 120мс (мин 53мс) + send one-way ~110–150мс ⇒ detect→секвенсер ~0.2–0.27с — целевая полоса
+P(B0+1) 13–21% (было 7–10%). Тесты: 134/134 зелёные (было 72). Гарантии не тронуты: kill-switch,
+дедуп, флоры, sizing, бид-математика Phase 2 — тот же код, лишь вынесен раньше по времени.
