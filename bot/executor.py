@@ -1076,7 +1076,8 @@ def _mempool_log(**kw) -> None:
         if isinstance(v, bool):
             return "1" if v else "0"
         if isinstance(v, float):
-            return f"{v:.1f}"
+            r = round(v, 6)                       # fixed-point, no sci-notation, no false 0.0:
+            return str(int(r)) if r == int(r) else format(r, "f").rstrip("0").rstrip(".")
         return str(v)
     kw.setdefault("ts", round(time.time(), 3))
     print("MEMPOOL " + " ".join(f"{k}={fmt(v)}" for k, v in kw.items()))
