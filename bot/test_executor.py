@@ -636,6 +636,95 @@ class TestPredictPreArm(unittest.TestCase):
             ex._rpc_write = save_w
 
 
+class _FakeAggResp:
+    def __init__(self, payload):
+        self._p = payload
+
+    def read(self):
+        return self._p
+
+
+class _FakeAggConn:
+    """A dedicated http.client-shaped connection for _PredictAggReader: answers decimals() and
+    latestRoundData() from the request body's selector. Records every request so the test can
+    assert the reader used THIS connection (not analysis.rpc._POOL)."""
+    def __init__(self):
+        self.requests = []
+        self._last = None
+
+    def request(self, method, path, body, headers):
+        self.requests.append(body)
+        self._last = body
+
+    def getresponse(self):
+        data = json.loads(self._last)["params"][0]["data"]
+        if data == ex.SEL_DECIMALS:
+            result = "0x" + (8).to_bytes(32, "big").hex()
+        else:                                             # latestRoundData: 5 words
+            result = "0x" + b"".join(v.to_bytes(32, "big", signed=v < 0) for v in
+                                     (1, 6300000000000, 0, 12345, 1)).hex()
+        return _FakeAggResp(json.dumps({"jsonrpc": "2.0", "id": 1, "result": result}).encode())
+
+    def close(self):
+        pass
+
+
+class TestPredictAggReaderIsolation(unittest.TestCase):
+    """The predict aggregator poll MUST use its OWN connection and never analysis.rpc's shared,
+    unlocked, single-threaded-assumption _POOL (which the main loop's read_rpc uses) — otherwise a
+    concurrent poll corrupts the fire-path's block-poll/price-refresh reads."""
+
+    def test_reader_uses_own_conn_not_shared_pool(self):
+        import analysis.rpc as arpc
+        saved_pool, saved_pooled = dict(arpc._POOL), arpc._pooled_post
+        arpc._POOL.clear()
+        ex._predict_agg_decimals.clear()
+        boom = {"n": 0}
+
+        def _boom(*a, **k):
+            boom["n"] += 1
+            raise AssertionError("predict poll must not go through analysis.rpc._pooled_post")
+        arpc._pooled_post = _boom
+        conn = _FakeAggConn()
+        try:
+            reader = ex._PredictAggReader("https://rpc.example/path", connect=lambda: conn)
+            out = ex._predict_poll_pushes(reader)
+            pool_after = dict(arpc._POOL)
+        finally:
+            arpc._pooled_post = saved_pooled
+            arpc._POOL.clear()
+            arpc._POOL.update(saved_pool)
+            ex._predict_agg_decimals.clear()
+        self.assertEqual(set(out), {"BTCUSDT", "ETHUSDT"})    # both feeds read
+        self.assertEqual(out["BTCUSDT"], (12345, 63000.0))    # updatedAt + price decoded
+        self.assertEqual(boom["n"], 0)                        # never used the shared pool
+        self.assertEqual(pool_after, {})                      # _POOL untouched by the predict poll
+        self.assertTrue(conn.requests)                        # used the dedicated connection
+
+    def test_reader_reconnects_once_on_error(self):
+        conns = []
+
+        class _FlakyConn(_FakeAggConn):
+            def __init__(self, fail):
+                super().__init__()
+                self.fail = fail
+
+            def getresponse(self):
+                if self.fail:                             # only the first (stale) socket fails
+                    raise OSError("stale socket")
+                return super().getresponse()
+
+        def connect():
+            c = _FlakyConn(fail=(len(conns) == 0))        # first conn stale, fresh reconnect ok
+            conns.append(c)
+            return c
+        reader = ex._PredictAggReader("https://rpc.example/", connect=connect)
+        # first attempt raises OSError -> reconnect-once succeeds on the fresh connection
+        res = reader.eth_call("0x" + "ab" * 20, ex.SEL_DECIMALS)
+        self.assertEqual(int(res, 16), 8)
+        self.assertEqual(len(conns), 2)                       # one reconnect happened
+
+
 class TestArmRefresh(unittest.TestCase):
     """Idle-zone arming: quotes/thresholds cached, blind-fire gating, sanity preflight."""
 

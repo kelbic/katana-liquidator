@@ -263,6 +263,11 @@ PREDICT_ARM_MAX_N = int(os.environ.get("KT_PREDICT_ARM_MAX_N", "8"))
 PREDICT_POLL_SEC = float(os.environ.get("KT_PREDICT_POLL_SEC", "2.0"))   # aggregator latestRound
 PREDICT_INTERVAL_SEC = float(os.environ.get("KT_PREDICT_INTERVAL", "0.5"))   # driver step cadence
 PREDICT_WS_URL = os.environ.get("KT_PREDICT_WS_URL", "wss://stream.binance.com:9443/ws")
+# The aggregator poll runs on the predict driver thread and MUST NOT share analysis.rpc's process-
+# global keep-alive pool with the main loop (http.client connections are not thread-safe). It uses
+# a DEDICATED connection (_PredictAggReader) to this endpoint — same URL is fine, its own socket.
+PREDICT_HTTP_URL = os.environ.get("KT_PREDICT_HTTP_URL",
+                                  (READ_RPCS[0] if READ_RPCS else DEFAULT_RPCS[0]))
 PREDICT_SYMBOLS = tuple(s.strip().upper()
                         for s in os.environ.get("KT_PREDICT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
                         if s.strip())
@@ -1813,11 +1818,65 @@ def _start_mempool(st: dict):
     return client
 
 
-def _predict_poll_pushes(rpc: Rpc) -> dict:
+class _PredictAggReader:
+    """Dedicated http.client read lane for the prediction aggregator polls — its OWN kept-alive
+    connection, so a latestRoundData read on the predict driver thread never touches analysis.rpc's
+    process-global (unlocked, single-threaded-assumption) _POOL nor the mempool lane. Single-
+    threaded (only the driver calls it), reconnect-once. Mirrors bot/mempool._TxFetcher.
+
+    eth_call(to, data) matches Rpc.eth_call's 2-arg surface (returns the result hex, raises on a
+    transport/node error — _predict_poll_pushes catches per-feed). `connect` is injectable for
+    offline tests (so the isolation from _POOL is asserted without network)."""
+
+    def __init__(self, url: str, timeout: float = 3.0, connect=None):
+        self._u = urllib.parse.urlsplit(url)
+        self.timeout = timeout
+        self._connect = connect or self._default_connect
+        self._conn: http.client.HTTPConnection | None = None
+        self._id = 0
+
+    def _default_connect(self):
+        cls = (http.client.HTTPSConnection if self._u.scheme == "https"
+               else http.client.HTTPConnection)
+        return cls(self._u.netloc, timeout=self.timeout)
+
+    def eth_call(self, to: str, data: str, *_a, **_k) -> str:
+        self._id += 1
+        body = json.dumps({"jsonrpc": "2.0", "id": self._id, "method": "eth_call",
+                           "params": [{"to": to, "data": data}, "latest"]}).encode()
+        last: Exception | None = None
+        for fresh in (False, True):                     # reused socket, then one fresh reconnect
+            if self._conn is None or fresh:
+                if self._conn is not None:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                self._conn = self._connect()
+            try:
+                self._conn.request("POST", self._u.path or "/", body,
+                                   {"Content-Type": "application/json",
+                                    "User-Agent": "Mozilla/5.0"})
+                d = json.loads(self._conn.getresponse().read())
+                if d.get("error"):
+                    raise RuntimeError(f"eth_call: {d['error']}")
+                return d["result"]
+            except (OSError, http.client.HTTPException, ValueError) as e:
+                last = e
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+                self._conn = None
+        raise RuntimeError(f"predict agg read transport: {last}")
+
+
+def _predict_poll_pushes(reader: "_PredictAggReader") -> dict:
     """Read each tracked feed's Chainlink aggregator latestRoundData DIRECTLY (from the zero
     address — a contract-caller multicall is rejected by the aggregator's access control). Returns
     {symbol: (updatedAt, price_float)}; a per-feed read failure just omits that symbol so the
-    driver skips it. Runs on the predict driver's OWN read lane (never the main loop's rpc)."""
+    driver skips it. `reader` is the predict layer's DEDICATED connection (never analysis.rpc's
+    shared _POOL, never the main loop's lanes)."""
     from bot import predict as _pr
     out: dict = {}
     for sym in PREDICT_SYMBOLS:
@@ -1828,9 +1887,9 @@ def _predict_poll_pushes(rpc: Rpc) -> dict:
         try:
             dec = _predict_agg_decimals.get(agg)
             if dec is None:
-                dec = int(rpc.eth_call(agg, SEL_DECIMALS), 16)
+                dec = int(reader.eth_call(agg, SEL_DECIMALS), 16)
                 _predict_agg_decimals[agg] = dec
-            raw = bytes.fromhex(rpc.eth_call(agg, SEL_LATEST_ROUND_DATA)[2:])
+            raw = bytes.fromhex(reader.eth_call(agg, SEL_LATEST_ROUND_DATA)[2:])
             answer = int.from_bytes(raw[32:64], "big", signed=True)   # word[1] = answer
             updated_at = int.from_bytes(raw[96:128], "big")           # word[3] = updatedAt
             if answer > 0:
@@ -1854,14 +1913,15 @@ def _start_predict(st: dict):
         from bot import predict as _pr
         feed = PriceFeed(symbols=PREDICT_SYMBOLS, ws_url=PREDICT_WS_URL)
         feed.start()
-        # dedicated read lane for the aggregator polls (own Rpc — never the main loop's lanes)
-        agg_rpc = Rpc(READ_RPCS or list(DEFAULT_RPCS), retries=1, min_interval=0.0,
-                      backoff_429=0.05, timeout=3.0)
+        # DEDICATED read lane for the aggregator polls: its OWN http.client connection, isolated
+        # from analysis.rpc._POOL (which the main loop's read_rpc uses and which is NOT thread-
+        # safe) and from the mempool lane — reconnect-once, 3s timeout.
+        agg_reader = _PredictAggReader(PREDICT_HTTP_URL, timeout=3.0)
         engine = _pr.PredictEngine(PREDICT_SYMBOLS, arm_pct=PREDICT_ARM_PCT,
                                    disarm_pct=PREDICT_DISARM_PCT,
                                    falsepos_window=PREDICT_FALSEPOS_WINDOW)
         driver = _pr.PredictDriver(engine, mid_fn=feed.mid,
-                                   poll_fn=lambda: _predict_poll_pushes(agg_rpc),
+                                   poll_fn=lambda: _predict_poll_pushes(agg_reader),
                                    on_arm=_predict_on_arm, interval=PREDICT_INTERVAL_SEC,
                                    poll_interval=PREDICT_POLL_SEC)
         driver.start()
