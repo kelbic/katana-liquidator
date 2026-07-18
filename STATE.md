@@ -397,3 +397,33 @@ lead_s по `confirmed`. Всё меряется на НАШЕМ live-поток
 Тесты: 239/239 зелёные (было 202: +9 pricefeed, +21 predict, +7 executor-prearm/poll-изоляция).
 Экономика/гарды/sizing/kill-switch/fire-логика/Phase-2 bid — БАЙТ-в-БАЙТ, это только детект/
 расписание.
+
+## 2026-07-18 — фиксы ревью (A: гонки нонса, B: Sushi Partial, C: shadow-widen, D: stale mid)
+
+- **A (обязательно ДО KT_MEMPOOL_LIVE=1):** ВСЕ мутации `st["fires"]/["gas_usd"]/["sent"]` — под
+  `_fire_lock` (fire(), refund в _fire_fast, _record/_settle/_record_send_error/_post_broadcast/
+  _check_pending); WSS-поток клеймит нонс через равенство `fires_at_sign == st["fires"]` под этим
+  же локом. `_arm_refresh` читает счётчик под локом ДО nonce-RPC/подписи (fire в середине арма
+  теперь ИНВАЛИДИРУЕТ entry — безопасное направление). `save_state` сериализует st под локом
+  (файл пишется вне) — раньше json.dump мог упасть на «dictionary changed size during iteration».
+- **B (живая деградация fast path):** Sushi status=Partial (роут покрывает ЧАСТЬ amount; для
+  weETH/vbETH/avKAT на крупных размерах — постоянный) теперь `PartialRouteError`: fail-fast, без
+  ретраев, частичный output НИКОГДА не считается полным. evaluate() кэширует минимальный
+  Partial-размер per (coll,loan) на DECLINE_TTL и скипает заведомо-большие фракции БЕЗ сети —
+  лестница фракций доходит до проходного размера внутри arm-дедлайна. Budget-stop в _arm_refresh
+  (обрыв ниже одного quote) больше не классифицируется как экономический decline (60с-самобан
+  замораживал лестницу). Armed-entry для Partial-тяжёлой пары строится за ~2 окна (тест).
+- **C (`KT_PREDICT_SHADOW_WIDEN`, дефолт 1):** в SHADOW предикт теперь ТОЖЕ расширяет arm-set
+  (строится/подписывается как в live) — иначе все MEMPOOL signal шли с n_armed=0 и решение о
+  KT_MEMPOOL_LIVE не на чем принимать. Броадкаста нет ПО ПОСТРОЕНИЮ: `_mempool_signal` шлёт
+  armed-entry в `_shadow_same_block` (только лог, send-вызова нет) если не `_same_block_live()`
+  (требует MEMPOOL_LIVE=1 + SHADOW=0 + live executor). Газ/kill-switch за shadow-arm не трогаются.
+  `prearm`/`prearm_clear` несут `mode=live|shadow_widen`; на старте — громкая строка.
+- **D (`KT_PRICEFEED_STALE_SEC`, дефолт 10с):** `PriceFeed.mid()` → `(mid, ts)`; драйвер
+  замораживает движок фида при mid старше порога (обрыв Binance WS, бэкофф до 30с): никаких
+  arm/disarm/falsepos из стухших периодов, пуши откладываются до recovery (ре-анкор по СВЕЖЕМУ
+  mid), `PREDICT event=stale`/`recovered` один раз на эпизод, arm-таймер сдвигается на длину
+  слепого окна (falsepos зреет только по НАБЛЮДАЕМОМУ времени, lead_s не пачкается).
+
+Тесты: 270/270 зелёные (+11 A-гонки, +10 B-Partial, +4 C-widen, +6 D-stale). Экономические
+гарантии не тронуты: Partial никогда не считается полным филлом, shadow не шлёт и не начисляет.
