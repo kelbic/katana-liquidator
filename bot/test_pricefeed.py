@@ -59,8 +59,8 @@ class TestParse(unittest.TestCase):
     def test_booticker_sets_mid(self):
         f, _ = _feed()
         f._on_message(json.loads(_book("BTCUSDT", 63000, 63002)))
-        self.assertEqual(f.mid("BTCUSDT"), 63001.0)        # (bid+ask)/2
-        self.assertEqual(f.mid("btcusdt"), 63001.0)        # case-insensitive
+        self.assertEqual(f.mid("BTCUSDT")[0], 63001.0)     # (bid+ask)/2
+        self.assertEqual(f.mid("btcusdt")[0], 63001.0)     # case-insensitive
         self.assertIsNone(f.mid("ETHUSDT"))                # untouched
         self.assertEqual(f.stats["ticks"], 1)
 
@@ -74,7 +74,7 @@ class TestParse(unittest.TestCase):
         f, _ = _feed()
         f._on_message({"stream": "ethusdt@bookTicker",
                        "data": {"s": "ETHUSDT", "b": "1800.0", "a": "1802.0"}})
-        self.assertEqual(f.mid("ETHUSDT"), 1801.0)
+        self.assertEqual(f.mid("ETHUSDT")[0], 1801.0)
 
     def test_malformed_no_mid(self):
         f, _ = _feed()
@@ -93,7 +93,7 @@ class TestParse(unittest.TestCase):
         f, _ = _feed(on_tick=boom)
         f._on_message(json.loads(_book("BTCUSDT", 100, 102)))   # must not raise
         self.assertEqual(seen, [("BTCUSDT", 101.0, 42.0)])
-        self.assertEqual(f.mid("BTCUSDT"), 101.0)               # still recorded
+        self.assertEqual(f.mid("BTCUSDT")[0], 101.0)            # still recorded
 
 
 class TestServeAndSubscribe(unittest.TestCase):
@@ -118,8 +118,8 @@ class TestServeAndSubscribe(unittest.TestCase):
             f._serve(conn)
         except mp.WsClosed:
             pass
-        self.assertEqual(f.mid("BTCUSDT"), 63002.0)
-        self.assertEqual(f.mid("ETHUSDT"), 1800.0)
+        self.assertEqual(f.mid("BTCUSDT")[0], 63002.0)
+        self.assertEqual(f.mid("ETHUSDT")[0], 1800.0)
 
 
 class TestReconnect(unittest.TestCase):
@@ -142,7 +142,24 @@ class TestReconnect(unittest.TestCase):
         if len(clock.slept) >= 2:
             self.assertGreaterEqual(clock.slept[1], clock.slept[0])   # grows
         self.assertGreater(f.stats["reconnects"], 0)
-        self.assertEqual(f.mid("BTCUSDT"), 63001.0)            # data from the good connection
+        self.assertEqual(f.mid("BTCUSDT")[0], 63001.0)         # data from the good connection
+
+
+class TestMidTimestamp(unittest.TestCase):
+    def test_mid_carries_feed_clock_timestamp(self):
+        # mid() returns (mid, ts) so consumers can age-gate a frozen price during a WS drop
+        # (the predict driver's KT_PRICEFEED_STALE_SEC gate) — a bare float had no way to
+        # distinguish 'live tick' from '30s-old value served during reconnect backoff'.
+        clock = _Clock()
+        f, _ = _feed(clock=clock)
+        f._on_message(json.loads(_book("BTCUSDT", 63000, 63002)))
+        self.assertEqual(f.mid("BTCUSDT"), (63001.0, 1000.0))   # ts = clock at the tick
+        clock.t += 25.0                                         # time passes, NO new tick
+        mid, ts = f.mid("BTCUSDT")
+        self.assertEqual(ts, 1000.0)                            # ts frozen with the price
+        self.assertEqual(clock.now() - ts, 25.0)                # consumer can see the age
+        f._on_message(json.loads(_book("BTCUSDT", 63010, 63012)))
+        self.assertEqual(f.mid("BTCUSDT"), (63011.0, 1025.0))   # fresh tick refreshes ts
 
 
 class TestHealth(unittest.TestCase):

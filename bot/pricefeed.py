@@ -43,8 +43,9 @@ BACKOFF_MAX_SEC = float(os.environ.get("KT_PREDICT_BACKOFF_MAX", "30.0"))
 
 class PriceFeed:
     """Background Binance WS reader. Construct with the symbols to track (upper-case, e.g.
-    "BTCUSDT"), call start(); read mid(symbol) / healthy() from the main loop. on_tick(symbol,
-    mid, wall) — if given — fires in THIS thread on every update (keep it fast + thread-safe).
+    "BTCUSDT"), call start(); read mid(symbol) -> (mid, ts_mono) / healthy() from the main
+    loop. on_tick(symbol, mid, wall) — if given — fires in THIS thread on every update (keep
+    it fast + thread-safe).
 
     Subscribes to `<symbol lower>@bookTicker` for each symbol and tracks the mid = (bid+ask)/2.
     bookTicker is best-bid/ask only (no trade needed to move), so the mid tracks the venue price
@@ -60,7 +61,7 @@ class PriceFeed:
         self._now, self._sleep, self._log, self._wall = now, sleep, log, wall
         self.stale_sec, self.backoff_max = stale_sec, backoff_max
         self._lock = threading.Lock()
-        self._mid: dict[str, float] = {}
+        self._mid: dict[str, tuple[float, float]] = {}     # sym -> (mid, ts of self._now clock)
         self._connected = False
         self._last_msg = 0.0
         self._stop = threading.Event()
@@ -80,7 +81,11 @@ class PriceFeed:
             self._connected = False
 
     # -- main loop reads these (thread-safe) ------------------------------------
-    def mid(self, symbol: str) -> float | None:
+    def mid(self, symbol: str) -> tuple[float, float] | None:
+        """(mid, ts) — ts is the feed clock (time.monotonic by default) at the last bookTicker
+        for THIS symbol, so consumers can age-gate: on a WS drop (backoff up to 30s) the last
+        mid would otherwise be served FROZEN and silently feed the prediction engine a stale
+        price (dirtying the shadow metrics the go-live decision reads). None = no data yet."""
         with self._lock:
             return self._mid.get(symbol.upper())
 
@@ -155,7 +160,7 @@ class PriceFeed:
         if mid <= 0:
             return
         with self._lock:
-            self._mid[sym] = mid
+            self._mid[sym] = (mid, self._now())
         self.stats["ticks"] += 1
         if self.on_tick is not None:
             try:

@@ -63,6 +63,8 @@ Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFI
   arm never sees a push (must exceed the push lead p90; arms persist, release is retrace-driven),
   KT_PREDICT_ARM_HF (1.006) / KT_PREDICT_ARM_MAX_N (8) — widened arm ceiling/cap for a live-
   pre-armed feed's markets, KT_PREDICT_POLL_SEC (2) — aggregator latestRoundData push poll,
+  KT_PRICEFEED_STALE_SEC (10) — ignore a Binance mid older than this (WS drop): the predict
+  engine freezes for that feed (no arm/disarm/falsepos; `PREDICT event=stale`/`recovered`),
   KT_PREDICT_WS_URL (wss://stream.binance.com:9443/ws) / KT_PREDICT_SYMBOLS (BTCUSDT,ETHUSDT),
   KT_RACE_ALERT_MIN_USD (=KT_MIN_PROFIT_USD) — only alert competitor races worth this much (all
   races still logged + counted).
@@ -276,6 +278,11 @@ PREDICT_HOLD_SEC = float(os.environ.get("KT_PREDICT_HOLD_SEC",
 # targets we pre-sign changes (scheduling), and only while a feed is armed under KT_PREDICT_LIVE.
 PREDICT_ARM_HF = float(os.environ.get("KT_PREDICT_ARM_HF", "1.006"))
 PREDICT_ARM_MAX_N = int(os.environ.get("KT_PREDICT_ARM_MAX_N", "8"))
+# Mid-age gate: a Binance mid older than this is STALE — the predict driver freezes that feed's
+# engine state (no arm/disarm/falsepos, pushes deferred, one `PREDICT event=stale`/`recovered`
+# pair per episode) instead of being silently fed the last pre-drop price during a WS outage
+# (reconnect backoff reaches 30s), which dirtied the shadow metrics the go-live decision reads.
+PRICEFEED_STALE_SEC = float(os.environ.get("KT_PRICEFEED_STALE_SEC", "10"))
 PREDICT_POLL_SEC = float(os.environ.get("KT_PREDICT_POLL_SEC", "2.0"))   # aggregator latestRound
 PREDICT_INTERVAL_SEC = float(os.environ.get("KT_PREDICT_INTERVAL", "0.5"))   # driver step cadence
 PREDICT_WS_URL = os.environ.get("KT_PREDICT_WS_URL", "wss://stream.binance.com:9443/ws")
@@ -2055,7 +2062,8 @@ def _start_predict(st: dict):
         driver = _pr.PredictDriver(engine, mid_fn=feed.mid,
                                    poll_fn=lambda: _predict_poll_pushes(agg_reader),
                                    on_arm=_predict_on_arm, interval=PREDICT_INTERVAL_SEC,
-                                   poll_interval=PREDICT_POLL_SEC)
+                                   poll_interval=PREDICT_POLL_SEC,
+                                   stale_sec=PRICEFEED_STALE_SEC)
         driver.start()
     except Exception as e:
         print(f"[predict] failed to start (fire path unaffected): {e}")

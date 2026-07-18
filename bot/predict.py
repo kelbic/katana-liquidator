@@ -40,6 +40,13 @@ PREDICT shadow-log grammar (greppable; `PREDICT ` + space-separated key=value, `
   event=falsepos   feed held_s ret_pct peak_ret_pct              — armed, held DEVIATED past the
                                                    KT_PREDICT_HOLD_SEC cap (600s) with no push and
                                                    no retrace (real Binance-vs-median disagreement).
+  event=stale      feed age_s                   — the Binance mid for this feed went STALE
+                                                   (older than KT_PRICEFEED_STALE_SEC; WS drop/
+                                                   backoff): engine state FROZEN — no arm/disarm/
+                                                   falsepos, pushes deferred. Once per episode.
+  event=recovered  feed stale_s                 — fresh mid again after stale_s of blindness;
+                                                   the arm clock is shifted by the gap so held/
+                                                   lead timers count only observed time.
   event=prearm     feed markets n mode          — published N market(s) for the widened arm set;
                                                    mode=live (real pre-arm) or shadow_widen
                                                    (KT_PREDICT_SHADOW_WIDEN: built/signed as in
@@ -72,6 +79,12 @@ DISARM_PCT = 0.0035
 # comfortably exceed the measured push lead (research p90 = 132s BTC / 325s ETH; a 90s cap wrongly
 # cleared genuine slow-build true positives and mislabelled them falsepos), hence 600s default.
 HOLD_SEC = 600.0
+# Mid-age gate (KT_PRICEFEED_STALE_SEC, executor wires it in): a PriceFeed mid older than this is
+# STALE — on a Binance WS drop (reconnect backoff up to 30s) the engine would otherwise be fed the
+# last pre-drop price as if live, generating phantom arm/disarm/falsepos that dirty the shadow
+# metrics the go-live decision reads. While stale the driver FREEZES the feed's engine state (no
+# on_mid, no falsepos timer, pushes deferred) and logs one `stale`/`recovered` pair per episode.
+MID_STALE_SEC = 10.0
 
 
 def markets_for_symbol(symbol: str) -> set[str]:
@@ -207,21 +220,36 @@ class PredictEngine:
         f.peak_return = 0.0
         return events
 
-    def tick(self, wall: float | None = None) -> list[dict]:
+    def tick(self, wall: float | None = None,
+             exclude: set[str] | None = None) -> list[dict]:
         """Time-driven LAST-RESORT release. An arm PERSISTS while the price stays deviated — the
         normal release is disarm-on-retrace (on_mid), never a timer, because a genuine push can
         lag by minutes (research lead p90 = 132s BTC / 325s ETH). Only when the price has held
         deviated past the generous HOLD_SEC cap with no push do we give up: a real Binance-vs-
         Chainlink-median disagreement -> falsepos. Disarm + suppress re-arm until a retrace clears
-        it (so we don't arm→falsepos→arm loop while the price sits just above the band)."""
+        it (so we don't arm→falsepos→arm loop while the price sits just above the band).
+        `exclude`: symbols whose pricefeed is STALE right now — their state is frozen, a blind
+        period must never mature the falsepos cap (the driver shifts the arm clock on recovery,
+        see freeze_gap)."""
         events: list[dict] = []
         for f in self.feeds.values():
+            if exclude and f.symbol in exclude:
+                continue
             if f.armed and f.arm_mono is not None and \
                     (self._now() - f.arm_mono) >= self.falsepos_window:
                 r = self.ret(f.symbol)
                 events.append(self._end(f, "falsepos", r))
                 f.suppressed = True
         return events
+
+    def freeze_gap(self, symbol: str, gap_s: float) -> None:
+        """A pricefeed blind spot (stale-mid episode) just ended: shift this feed's arm clock
+        forward by the gap so held/lead timers count only OBSERVED time — otherwise a 10-minute
+        WS outage would mature the falsepos cap the instant data returns (mislabelled falsepos)
+        and lead_s over 'confirmed' would include time we were provably blind."""
+        f = self.feeds.get(symbol.upper())
+        if f is not None and f.arm_mono is not None and gap_s > 0:
+            f.arm_mono += gap_s
 
     def _end(self, f: Feed, kind: str, r: float | None) -> dict:
         held = (self._now() - f.arm_mono) if f.arm_mono is not None else None
@@ -243,7 +271,12 @@ class PredictDriver:
     on_disarm. Isolated exactly like MempoolClient: own thread, own injected read lane; every
     step is wrapped so a poll/parse error degrades to 'no prediction this step', never a wedge.
 
-    mid_fn(symbol)->float|None            latest Binance mid (PriceFeed.mid).
+    mid_fn(symbol)->(mid:float, ts:float)|float|None   latest Binance mid (PriceFeed.mid). The
+                                          (mid, ts) form enables the stale gate: a mid whose ts
+                                          (same clock as `now`) is older than stale_sec FREEZES
+                                          that feed — no on_mid, no falsepos timer, pushes
+                                          deferred — and logs `stale`/`recovered` once per
+                                          episode. A bare float (legacy/tests) is never stale.
     poll_fn()-> {symbol: (updatedAt:int, price:float)} | {}   aggregator latestRoundData read.
     on_arm(armed_symbols:set[str])        called ONLY when the armed set changes (arm OR disarm)
                                           with the CURRENT set of armed symbols. LIVE publishes
@@ -253,19 +286,23 @@ class PredictDriver:
 
     def __init__(self, engine: PredictEngine, mid_fn, poll_fn, on_arm=None,
                  log=print, interval: float = 0.5, poll_interval: float = 2.0,
+                 stale_sec: float = MID_STALE_SEC,
                  now=time.monotonic, sleep=time.sleep, wall=time.time):
         self.engine = engine
         self.mid_fn, self.poll_fn = mid_fn, poll_fn
         self.on_arm = on_arm
         self.log = log
         self.interval, self.poll_interval = interval, poll_interval
+        self.stale_sec = stale_sec
         self._now, self._sleep, self._wall = now, sleep, wall
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_updated: dict[str, int] = {}
         self._last_poll: float | None = None       # None -> the first step polls immediately
         self._prev_armed: set[str] = set()
-        self.stats = {"steps": 0, "arms": 0, "confirmed": 0, "falsepos": 0, "poll_fail": 0}
+        self._stale_since: dict[str, float] = {}   # sym -> now() at stale-episode detect
+        self.stats = {"steps": 0, "arms": 0, "confirmed": 0, "falsepos": 0, "poll_fail": 0,
+                      "stale_episodes": 0}
 
     def start(self) -> None:
         if self._thread is not None:
@@ -285,20 +322,46 @@ class PredictDriver:
             self._sleep(self.interval)
 
     def step(self) -> None:
-        """One drive tick (public for offline tests): poll aggregators on cadence -> feed pushes
-        + lazy bootstrap, feed the latest mids, run the falsepos timer, log all events, and
-        publish the armed-market delta."""
+        """One drive tick (public for offline tests): classify each feed's mid (fresh vs stale)
+        -> poll aggregators on cadence (stale feeds' pushes deferred) -> feed the FRESH mids,
+        run the falsepos timer (stale feeds excluded — their state is frozen), log all events,
+        and publish the armed-market delta. Stale episodes emit exactly one `stale` and one
+        `recovered` line and generate NO arm/disarm/falsepos in between."""
         self.stats["steps"] += 1
         wall = self._wall()
         events: list[dict] = []
+        fresh: dict[str, float] = {}
+        stale: set[str] = set()
+        for sym in self.engine.feeds:
+            v = self.mid_fn(sym)
+            if v is None:
+                continue                                    # no data yet — nothing to gate
+            mid, ts = v if isinstance(v, tuple) else (v, None)
+            if ts is not None and (self._now() - ts) > self.stale_sec:
+                stale.add(sym)
+                if sym not in self._stale_since:            # once per episode
+                    self._stale_since[sym] = self._now()
+                    self.stats["stale_episodes"] += 1
+                    events.append({"event": "stale", "feed": self.engine.feeds[sym].label,
+                                   "age_s": round(self._now() - ts, 3)})
+                continue
+            if sym in self._stale_since:                    # episode over — resume
+                gap = self._now() - self._stale_since.pop(sym)
+                self.engine.freeze_gap(sym, gap)            # timers count observed time only
+                events.append({"event": "recovered", "feed": self.engine.feeds[sym].label,
+                               "stale_s": round(gap, 3)})
+                # feed the recovered mid BEFORE this step's poll: a push deferred during the
+                # episode is processed this step and must re-anchor to the RECOVERED price,
+                # never the frozen one (cold-start order — poll bootstrap first — unchanged).
+                events += self.engine.on_mid(sym, mid, wall)
+                continue
+            fresh[sym] = mid
         if self._last_poll is None or (self._now() - self._last_poll) >= self.poll_interval:
             self._last_poll = self._now()
-            events += self._poll(wall)
-        for sym in self.engine.feeds:
-            mid = self.mid_fn(sym)
-            if mid is not None:
-                events += self.engine.on_mid(sym, mid, wall)
-        events += self.engine.tick(wall)
+            events += self._poll(wall, stale)
+        for sym, mid in fresh.items():
+            events += self.engine.on_mid(sym, mid, wall)
+        events += self.engine.tick(wall, exclude=stale)
         for ev in events:
             self.log(format_line(ev))
             if ev["event"] == "arm":
@@ -309,7 +372,7 @@ class PredictDriver:
                 self.stats["falsepos"] += 1
         self._publish()
 
-    def _poll(self, wall: float) -> list[dict]:
+    def _poll(self, wall: float, stale: set[str] | None = None) -> list[dict]:
         try:
             reads = self.poll_fn() or {}
         except Exception as e:
@@ -320,6 +383,11 @@ class PredictDriver:
         for sym, val in reads.items():
             sym = sym.upper()
             if sym not in self.engine.feeds or not val:
+                continue
+            if stale and sym in stale:
+                # frozen feed: DEFER the push (don't consume updatedAt) — on_push re-anchors
+                # to f.mid, and re-anchoring to a frozen pre-drop price would poison the
+                # return; the push is processed on the first poll after recovery instead.
                 continue
             updated_at, price = val
             f = self.engine.feeds[sym]

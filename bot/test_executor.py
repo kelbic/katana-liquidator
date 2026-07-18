@@ -740,6 +740,8 @@ class TestPredictPreArm(unittest.TestCase):
             out = _capture(ex._start_predict, {})
             self.assertIn("SHADOW WIDENING ACTIVE", out)
             self.assertIn("broadcast stays OFF", out)
+            # D: the mid-age gate is wired through to the driver (KT_PRICEFEED_STALE_SEC)
+            self.assertEqual(_FakeDriver.kwargs.get("stale_sec"), ex.PRICEFEED_STALE_SEC)
         finally:
             (pf_mod.PriceFeed, pr_mod.PredictDriver, ex.PREDICT, ex.PREDICT_SHADOW,
              ex.PREDICT_LIVE, ex.PREDICT_SHADOW_WIDEN,

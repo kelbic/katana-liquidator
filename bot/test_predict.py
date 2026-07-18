@@ -296,5 +296,114 @@ class TestDriver(unittest.TestCase):
         self.assertFalse(hasattr(d, "send"))
 
 
+class TestStaleMidGate(unittest.TestCase):
+    """D: a frozen Binance mid (WS drop, backoff to 30s) must FREEZE the engine — no arm/
+    disarm/falsepos from stale periods, pushes deferred — with exactly one `stale`/`recovered`
+    pair per episode, and post-recovery timers counting only OBSERVED time."""
+
+    def _driver(self, polls=None, stale_sec=10.0, falsepos_window=600.0):
+        clock = _DriverClock()
+        eng = pr.PredictEngine(("BTCUSDT",), arm_pct=0.0045, disarm_pct=0.0035,
+                               falsepos_window=falsepos_window, now=clock.now)
+        self.logs = []
+        self.mids = {}                            # sym -> (mid, ts) | float | None
+        pq = list(polls or [])
+
+        def poll_fn():
+            return pq.pop(0) if pq else {}
+        d = pr.PredictDriver(eng, mid_fn=lambda s: self.mids.get(s), poll_fn=poll_fn,
+                             log=self.logs.append, interval=0.5, poll_interval=2.0,
+                             stale_sec=stale_sec, now=clock.now, wall=clock.wall)
+        return d, eng, clock
+
+    def _kinds(self):
+        return [l.split("event=")[1].split(" ")[0]
+                for l in self.logs if l.startswith("PREDICT")]
+
+    def test_stale_mid_never_arms_and_logs_once_per_episode(self):
+        d, eng, clock = self._driver(polls=[{"BTCUSDT": (1, 1000.0)}])
+        self.mids["BTCUSDT"] = (1000.0, 0.0)
+        d.step()                                   # t=0: bootstrap anchor, fresh flat mid
+        clock.t = 30.0
+        self.mids["BTCUSDT"] = (1006.0, 5.0)       # +0.6% deviated but 25s old -> STALE
+        d.step()
+        self.assertNotIn("arm", self._kinds())     # frozen price generates NO arm
+        self.assertEqual(eng.armed_symbols(), set())
+        self.assertEqual(self._kinds().count("stale"), 1)
+        clock.t = 31.0
+        d.step()                                   # same episode -> no repeat line
+        self.assertEqual(self._kinds().count("stale"), 1)
+        self.assertEqual(d.stats["stale_episodes"], 1)
+
+    def test_recovery_logs_and_resumes_arming(self):
+        d, eng, clock = self._driver(polls=[{"BTCUSDT": (1, 1000.0)}])
+        self.mids["BTCUSDT"] = (1000.0, 0.0)
+        d.step()
+        clock.t = 30.0
+        self.mids["BTCUSDT"] = (1006.0, 5.0)       # stale episode
+        d.step()
+        clock.t = 40.0
+        self.mids["BTCUSDT"] = (1006.0, 39.5)      # fresh again, still deviated
+        d.step()
+        kinds = self._kinds()
+        self.assertIn("recovered", kinds)
+        self.assertIn("arm", kinds)                # deviation acted on ONLY once fresh
+        self.assertLess(kinds.index("recovered"), kinds.index("arm"))
+        self.assertEqual(eng.armed_symbols(), {"BTCUSDT"})
+
+    def test_stale_period_never_matures_falsepos_and_gap_is_credited(self):
+        d, eng, clock = self._driver(falsepos_window=600.0,
+                                     polls=[{"BTCUSDT": (1, 1000.0)}])
+        self.mids["BTCUSDT"] = (1006.0, 0.0)
+        d.step()                                   # t=0: bootstrap + arm (arm_mono=0)
+        self.assertEqual(eng.armed_symbols(), {"BTCUSDT"})
+        clock.t = 16.0                             # feed froze at ts=5 -> age 11 > 10
+        self.mids["BTCUSDT"] = (1006.0, 5.0)
+        d.step()                                   # stale episode starts (16s observed so far)
+        clock.t = 700.0
+        d.step()                                   # 700s armed on the wall clock...
+        self.assertNotIn("falsepos", self._kinds())   # ...but the blind period is frozen
+        self.assertEqual(eng.armed_symbols(), {"BTCUSDT"})
+        clock.t = 1300.0
+        self.mids["BTCUSDT"] = (1006.0, 1299.9)    # recovery after a 1284s gap
+        d.step()
+        self.assertIn("recovered", self._kinds())
+        self.assertNotIn("falsepos", self._kinds())   # observed armed time ~16s only
+        self.assertEqual(eng.armed_symbols(), {"BTCUSDT"})
+        clock.t = 1890.0                           # observed deviated ~606s >= 600 cap
+        self.mids["BTCUSDT"] = (1006.0, 1889.9)
+        d.step()
+        self.assertIn("falsepos", self._kinds())   # matures only on OBSERVED time
+
+    def test_push_deferred_while_stale_processed_on_recovery(self):
+        d, eng, clock = self._driver(polls=[
+            {"BTCUSDT": (1, 1000.0)},              # bootstrap
+            {"BTCUSDT": (2, 1010.0)},              # push arrives DURING the stale episode
+            {"BTCUSDT": (2, 1010.0)}])             # same round re-read after recovery
+        self.mids["BTCUSDT"] = (1006.0, 0.0)
+        d.step()                                   # t=0: bootstrap + arm
+        clock.t = 16.0
+        self.mids["BTCUSDT"] = (1006.0, 5.0)       # stale
+        d.step()                                   # poll #2 hits: push DEFERRED (mid frozen)
+        self.assertNotIn("confirmed", self._kinds())
+        self.assertNotIn("push", self._kinds())
+        clock.t = 20.0
+        self.mids["BTCUSDT"] = (1004.0, 19.9)      # fresh again
+        d.step()                                   # poll #3: deferred push processed NOW
+        kinds = self._kinds()
+        self.assertIn("confirmed", kinds)          # armed arm + real push -> confirmed
+        self.assertLess(kinds.index("recovered"), kinds.index("confirmed"))
+        self.assertEqual(eng.feeds["BTCUSDT"].anchor, 1004.0)   # re-anchored to the FRESH mid
+
+    def test_bare_float_mid_is_never_stale(self):
+        # legacy/test mid_fn contract (bare float, no ts) keeps working and is never gated
+        d, eng, clock = self._driver(polls=[{"BTCUSDT": (1, 1000.0)}])
+        self.mids["BTCUSDT"] = 1006.0
+        clock.t = 1000.0
+        d.step()
+        self.assertEqual(eng.armed_symbols(), {"BTCUSDT"})
+        self.assertEqual(d.stats["stale_episodes"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
