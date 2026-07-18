@@ -581,17 +581,20 @@ class TestArmCandidates(unittest.TestCase):
 
 
 class TestPredictPreArm(unittest.TestCase):
-    """The oracle-push prediction layer only ever WIDENS the pre-signed set for a live-pre-armed
-    feed's markets and NEVER fires. With prediction off/shadow, _arm_candidates is byte-identical
-    to the classic behaviour (empty published set)."""
+    """The oracle-push prediction layer only ever WIDENS the pre-signed set for a pre-armed
+    feed's markets and NEVER fires. With prediction off (or widening disabled), _arm_candidates
+    is byte-identical to the classic behaviour (empty published set). In SHADOW,
+    KT_PREDICT_SHADOW_WIDEN (default 1) publishes exactly like live — measurement needs armed
+    entries — while broadcast stays impossible (mempool shadow dispatch, asserted below)."""
 
     def setUp(self):
-        self._save = (ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW)
+        self._save = (ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW, ex.PREDICT_SHADOW_WIDEN)
         with ex._predict_lock:
             ex._predict_armed_markets = set()
 
     def tearDown(self):
-        (ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW) = self._save
+        (ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW,
+         ex.PREDICT_SHADOW_WIDEN) = self._save
         with ex._predict_lock:
             ex._predict_armed_markets = set()
 
@@ -612,17 +615,44 @@ class TestPredictPreArm(unittest.TestCase):
         got = [r["debt_usd"] for r in ex._arm_candidates(rows)]
         self.assertEqual(got, [9000, 2000])                   # widened target now pre-armed
 
-    def test_on_arm_shadow_publishes_nothing(self):
-        ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW = True, False, True   # shadow (default)
-        ex._predict_on_arm({"BTCUSDT"})
+    def test_widen_gating_matrix(self):
+        for pred, live, shadow, widen, want in [
+                (False, False, True, True, False),     # predict off -> never
+                (True, True, False, False, True),      # live pre-arm
+                (True, False, True, True, True),       # shadow + widen (the new default)
+                (True, False, True, False, False),     # shadow, widening disabled
+                (True, True, True, True, True),        # misconfig: shadow wins, widen applies
+                (True, False, False, True, False)]:    # neither live nor shadow-widen path
+            (ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW,
+             ex.PREDICT_SHADOW_WIDEN) = pred, live, shadow, widen
+            self.assertEqual(ex._predict_widen(), want,
+                             f"predict={pred} live={live} shadow={shadow} widen={widen}")
+
+    def test_on_arm_shadow_without_widen_publishes_nothing(self):
+        ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW = True, False, True
+        ex.PREDICT_SHADOW_WIDEN = False
+        _capture(ex._predict_on_arm, {"BTCUSDT"})
         self.assertEqual(ex._predict_armed_snapshot(), set())  # measure only — no side effect
+
+    def test_on_arm_shadow_widen_publishes_markets_with_mode(self):
+        from bot import predict as pr
+        ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW = True, False, True   # shadow (default)
+        ex.PREDICT_SHADOW_WIDEN = True
+        out = _capture(ex._predict_on_arm, {"BTCUSDT"})
+        self.assertEqual(ex._predict_armed_snapshot(), pr.markets_for_symbol("BTCUSDT"))
+        line = [ln for ln in out.splitlines() if "event=prearm " in ln][0]
+        self.assertIn("mode=shadow_widen", line)
+        out = _capture(ex._predict_on_arm, set())              # feed disarmed -> cleared
+        self.assertEqual(ex._predict_armed_snapshot(), set())
+        self.assertIn("prearm_clear", out)
 
     def test_on_arm_live_publishes_markets(self):
         from bot import predict as pr
         ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW = True, True, False   # live pre-arm
-        ex._predict_on_arm({"BTCUSDT"})
+        out = _capture(ex._predict_on_arm, {"BTCUSDT"})
         self.assertEqual(ex._predict_armed_snapshot(), pr.markets_for_symbol("BTCUSDT"))
-        ex._predict_on_arm(set())                              # feed disarmed -> cleared
+        self.assertIn("mode=live", out)
+        _capture(ex._predict_on_arm, set())                    # feed disarmed -> cleared
         self.assertEqual(ex._predict_armed_snapshot(), set())
 
     def test_pre_arm_never_broadcasts(self):
@@ -631,10 +661,89 @@ class TestPredictPreArm(unittest.TestCase):
         save_w = ex._rpc_write
         ex._rpc_write = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send"))
         try:
-            ex._predict_on_arm({"BTCUSDT"})
+            _capture(ex._predict_on_arm, {"BTCUSDT"})
             ex._arm_candidates([_hot_row(1.005, 9000)])       # widened, but no signing/sending
         finally:
             ex._rpc_write = save_w
+
+    def test_shadow_widened_signal_measures_never_sends_never_charges(self):
+        # C's no-broadcast/no-accrual guarantee, end to end: a widened armed entry + a mempool
+        # signal in SHADOW -> shadow_fire measured (n_armed=1) with ZERO sends and ZERO
+        # gas/kill-switch mutation. The send gate is _same_block_live() in _mempool_signal;
+        # _shadow_same_block has no send call at all.
+        ex.PREDICT, ex.PREDICT_LIVE, ex.PREDICT_SHADOW = True, False, True
+        ex.PREDICT_SHADOW_WIDEN = True
+        save = (ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE,
+                ex._mempool_send_raw, ex._rpc_write)
+        ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE = True, True, False
+        boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send"))  # noqa
+        ex._mempool_send_raw = boom
+        ex._rpc_write = boom
+        ex._arm.clear()
+        try:
+            _capture(ex._predict_on_arm, {"BTCUSDT"})          # widened in shadow
+            self.assertTrue(ex._predict_armed_snapshot())
+            e = _arm_entry()                                   # a signed armed entry, as live
+            ex._arm[e["key"]] = e
+            ex._publish_arm_snapshot()
+            st = {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0,
+                  "consec_reverts": 0, "reverts": 0}
+            before = json.dumps(st, sort_keys=True)
+            out = _capture(ex._mempool_signal, _sig(e), st)
+            self.assertEqual(json.dumps(st, sort_keys=True), before)   # NO st mutation at all
+            events = [_fields(ln)["event"] for ln in _mp_lines(out)]
+            self.assertEqual(events, ["signal", "shadow_fire"])
+            sig_line = _fields([ln for ln in _mp_lines(out) if "event=signal" in ln][0])
+            self.assertEqual(sig_line["n_armed"], "1")         # the measurement C exists for
+            self.assertEqual(sig_line["mode"], "shadow")
+        finally:
+            (ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE,
+             ex._mempool_send_raw, ex._rpc_write) = save
+            ex._arm.clear()
+            with ex._arm_lock:
+                ex._arm_snapshot = {}
+
+    def test_start_predict_logs_shadow_widening(self):
+        import bot.pricefeed as pf_mod
+        from bot import predict as pr_mod
+
+        class _FakeFeed:
+            stats = {"ticks": 0}
+
+            def __init__(self, **kw):
+                pass
+
+            def start(self):
+                pass
+
+            def mid(self, s):
+                return None
+
+            def healthy(self):
+                return False
+
+        class _FakeDriver:
+            kwargs = None
+
+            def __init__(self, *a, **k):
+                _FakeDriver.kwargs = k
+
+            def start(self):
+                pass
+        save = (pf_mod.PriceFeed, pr_mod.PredictDriver, ex.PREDICT, ex.PREDICT_SHADOW,
+                ex.PREDICT_LIVE, ex.PREDICT_SHADOW_WIDEN,
+                ex._predict_feed_ref, ex._predict_driver_ref)
+        pf_mod.PriceFeed, pr_mod.PredictDriver = _FakeFeed, _FakeDriver
+        ex.PREDICT, ex.PREDICT_SHADOW, ex.PREDICT_LIVE = True, True, False
+        ex.PREDICT_SHADOW_WIDEN = True
+        try:
+            out = _capture(ex._start_predict, {})
+            self.assertIn("SHADOW WIDENING ACTIVE", out)
+            self.assertIn("broadcast stays OFF", out)
+        finally:
+            (pf_mod.PriceFeed, pr_mod.PredictDriver, ex.PREDICT, ex.PREDICT_SHADOW,
+             ex.PREDICT_LIVE, ex.PREDICT_SHADOW_WIDEN,
+             ex._predict_feed_ref, ex._predict_driver_ref) = save
 
 
 class _FakeAggResp:

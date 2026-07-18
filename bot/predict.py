@@ -40,8 +40,12 @@ PREDICT shadow-log grammar (greppable; `PREDICT ` + space-separated key=value, `
   event=falsepos   feed held_s ret_pct peak_ret_pct              — armed, held DEVIATED past the
                                                    KT_PREDICT_HOLD_SEC cap (600s) with no push and
                                                    no retrace (real Binance-vs-median disagreement).
-  event=prearm     feed markets n                — (LIVE) published N market(s) for widened arm.
-  event=prearm_clear feed                        — (LIVE) cleared a feed's widened-arm markets.
+  event=prearm     feed markets n mode          — published N market(s) for the widened arm set;
+                                                   mode=live (real pre-arm) or shadow_widen
+                                                   (KT_PREDICT_SHADOW_WIDEN: built/signed as in
+                                                   live so mempool shadow measures n_armed>0,
+                                                   broadcast impossible by construction).
+  event=prearm_clear feed mode                   — cleared a feed's widened-arm markets.
 Analyzer notes: FP rate = (disarm + falsepos) / arm; recall = confirmed / (confirmed + push);
 lead-time distribution = lead_s over `confirmed`. ret_pct is signed % (dir up/down), ret_bps its
 integer basis-points magnitude. Everything is measured on OUR OWN live flow — validating the

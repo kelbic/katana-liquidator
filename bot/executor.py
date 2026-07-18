@@ -53,6 +53,10 @@ Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFI
   watch Binance BTC/ETH, predict the on-chain Chainlink push ~30-40s early, and PRE-ARM (widen the
   pre-signed set) — NEVER fires (the mempool/fast path still fires on the real push),
   KT_PREDICT_SHADOW (1) — default ON: measure lead-time/FP, log PREDICT lines, no pre-arm,
+  KT_PREDICT_SHADOW_WIDEN (1) — in SHADOW, still let predictions WIDEN the pre-signed arm set
+  (build/sign exactly as live) so the mempool shadow layer has armed entries to measure
+  (n_armed>0 -> shadow_fire lines feed the KT_MEMPOOL_LIVE decision); broadcast stays off by
+  construction (see _predict_widen) and shadow-arms charge no gas/kill-switch,
   KT_PREDICT_LIVE (0) — real pre-arm (needs SHADOW=0), still never fires on its own,
   KT_PREDICT_ARM_PCT (0.0045) / KT_PREDICT_DISARM_PCT (0.0035) — arm/retrace hysteresis on
   |return| from the anchor, KT_PREDICT_HOLD_SEC (600) — last-resort release when a still-deviated
@@ -253,6 +257,11 @@ def _same_block_live() -> bool:
 PREDICT = os.environ.get("KT_PREDICT", "0") == "1"                    # master switch (default OFF)
 PREDICT_SHADOW = os.environ.get("KT_PREDICT_SHADOW", "1") != "0"      # default ON (measure only)
 PREDICT_LIVE = os.environ.get("KT_PREDICT_LIVE", "0") == "1"          # real pre-arm (never fires)
+# In SHADOW, still widen the arm set on predictions (default ON): without it every MEMPOOL
+# event=signal logs n_armed=0 during predicted pushes (empty arm set at push time), shadow_fire
+# never happens and there is NO data to decide KT_MEMPOOL_LIVE on. Widening builds/signs the
+# pre-arm exactly as live; nothing broadcasts (see _predict_widen for where that's guaranteed).
+PREDICT_SHADOW_WIDEN = os.environ.get("KT_PREDICT_SHADOW_WIDEN", "1") != "0"
 PREDICT_ARM_PCT = float(os.environ.get("KT_PREDICT_ARM_PCT", "0.0045"))     # arm at |return| >=
 PREDICT_DISARM_PCT = float(os.environ.get("KT_PREDICT_DISARM_PCT", "0.0035"))  # retrace hysteresis
 # Hold cap: an arm persists while deviated (release is disarm-on-retrace); this is only the last-
@@ -284,6 +293,22 @@ def _predict_live() -> bool:
     """Real pre-arm is gated: predict on, LIVE set, SHADOW off. Even LIVE never FIRES — it only
     widens the pre-signed set; the fire still requires the mempool/fast-path on the real push."""
     return PREDICT and PREDICT_LIVE and not PREDICT_SHADOW
+
+
+def _predict_widen() -> bool:
+    """Prediction-driven arm-set widening is active: LIVE pre-arm, or SHADOW with measure-
+    widening on (KT_PREDICT_SHADOW_WIDEN, default 1). In shadow the widened entries are built,
+    preflighted and SIGNED exactly as live so the mempool shadow layer has armed entries to
+    measure (n_armed>0 -> shadow_fire feasibility lines), but no broadcast can result BY
+    CONSTRUCTION: _mempool_signal dispatches every armed entry to _shadow_same_block (compute +
+    MEMPOOL log line only — it has no send call) unless _same_block_live() is true, and
+    _same_block_live() requires KT_MEMPOOL_LIVE=1 AND KT_MEMPOOL_SHADOW=0 AND a live executor.
+    A widened entry that GENUINELY flips on-chain is taken by the v3 next-block fast path /
+    classic pass exactly as any armed entry today — that is the production fire path acting on
+    a real price, not a prediction (the predict layer itself never fires). Shadow-armed entries
+    charge NO gas and touch NO kill-switch state: only a real fire mutates st."""
+    return PREDICT and ((PREDICT_LIVE and not PREDICT_SHADOW)
+                        or (PREDICT_SHADOW and PREDICT_SHADOW_WIDEN))
 
 
 # fire-path tuning (review H7/H8): tight quote timeouts, bounded receipt wait, short success-
@@ -1076,9 +1101,10 @@ def fire(rpc: Rpc, t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -
 _arm: dict[str, dict] = {}
 
 # --- oracle-push PREDICTION pre-arm publish/consume (bot/predict.py drives this) -------------
-# The predict driver thread publishes the marketIds of the currently LIVE-pre-armed feeds here;
-# _arm_candidates reads a lock-guarded snapshot to widen the pre-signed net for those markets.
-# SHADOW/off never publishes -> the set stays empty -> _arm_candidates stays byte-identical.
+# The predict driver thread publishes the marketIds of the currently pre-armed feeds here
+# (LIVE, or SHADOW with KT_PREDICT_SHADOW_WIDEN — see _predict_widen); _arm_candidates reads a
+# lock-guarded snapshot to widen the pre-signed net for those markets. With widening inactive
+# nothing publishes -> the set stays empty -> _arm_candidates stays byte-identical.
 _predict_lock = threading.Lock()
 _predict_armed_markets: set[str] = set()   # marketId(lower) currently pre-armed by prediction
 
@@ -1089,12 +1115,15 @@ def _predict_armed_snapshot() -> set[str]:
 
 
 def _predict_on_arm(armed_symbols: set[str]) -> None:
-    """PredictDriver callback (driver thread): the armed Binance-symbol set changed. LIVE mode
-    republishes their markets so _arm_candidates widens; SHADOW/off publishes NOTHING (measure
-    only — zero effect on arm/fire state). NEVER signs or sends. Logs the prearm/prearm_clear
-    delta so the analyzer sees when the widened net opened/closed."""
+    """PredictDriver callback (driver thread): the armed Binance-symbol set changed. When
+    widening is active (_predict_widen: LIVE, or SHADOW+KT_PREDICT_SHADOW_WIDEN) republishes
+    their markets so _arm_candidates widens; otherwise publishes NOTHING (zero effect on
+    arm/fire state). NEVER signs or sends — in shadow the widened entries only feed the
+    mempool shadow measurements (broadcast impossible: see _predict_widen). Logs the
+    prearm/prearm_clear delta (mode=live|shadow_widen) so the analyzer sees when the widened
+    net opened/closed."""
     global _predict_armed_markets
-    if not _predict_live():
+    if not _predict_widen():
         return
     from bot import predict as _pr
     markets: set[str] = set()
@@ -1107,23 +1136,26 @@ def _predict_on_arm(armed_symbols: set[str]) -> None:
         return
     labels = sorted(_pr.FEED_LABEL[_pr.SYMBOL_FEED[s]]
                     for s in armed_symbols if s in _pr.SYMBOL_FEED)
+    mode = "live" if _predict_live() else "shadow_widen"
     if markets:
         pairs = sorted(oracles.market_pair(m) for m in markets)
         print(_pr.format_line({"event": "prearm", "feed": ",".join(labels) or "-",
-                               "markets": ",".join(pairs), "n": len(markets)}))
+                               "markets": ",".join(pairs), "n": len(markets), "mode": mode}))
     else:
-        print(_pr.format_line({"event": "prearm_clear", "feed": "-"}))
+        print(_pr.format_line({"event": "prearm_clear", "feed": "-", "mode": mode}))
 
 
 def _arm_candidates(rows: list[dict]) -> list[dict]:
     """Near-flip rows worth pre-arming: healthy but within KT_ARM_HF of the line, past the
     same MIN_DEBT gate once() applies to targets, biggest debt first, capped at ARM_MAX_N.
 
-    When the PREDICTION layer has LIVE-pre-armed a feed (Binance says a ~0.5% oracle push is
-    imminent), the ceiling for THAT feed's markets widens to KT_PREDICT_ARM_HF and the cap to
-    KT_PREDICT_ARM_MAX_N — a wider pre-signed net so the reaction to the real push collapses to
-    insert-tip+broadcast. `pa` is empty unless _predict_live() published markets, so with
-    prediction off/shadow this is byte-identical to the classic behaviour."""
+    When the PREDICTION layer has pre-armed a feed (Binance says a ~0.5% oracle push is
+    imminent; LIVE — or SHADOW with KT_PREDICT_SHADOW_WIDEN, measure-only), the ceiling for
+    THAT feed's markets widens to KT_PREDICT_ARM_HF and the cap to KT_PREDICT_ARM_MAX_N — a
+    wider pre-signed net so the reaction to the real push collapses to insert-tip+broadcast
+    (in shadow: so the mempool layer has entries to MEASURE). `pa` is empty unless
+    _predict_widen() published markets, so with prediction off (or widening disabled) this is
+    byte-identical to the classic behaviour."""
     pa = _predict_armed_snapshot()
     if pa:
         cand = [r for r in rows
@@ -2032,6 +2064,12 @@ def _start_predict(st: dict):
     print(f"[predict] oracle-push prediction layer started — {mode}; "
           f"arm>={PREDICT_ARM_PCT * 100:.2f}% disarm<{PREDICT_DISARM_PCT * 100:.2f}% "
           f"symbols={','.join(PREDICT_SYMBOLS)}")
+    if _predict_widen() and not _predict_live():
+        print("[predict] SHADOW WIDENING ACTIVE (KT_PREDICT_SHADOW_WIDEN=1): predictions "
+              "widen the pre-signed arm set (built/signed as in live) so mempool shadow "
+              "measures real n_armed/shadow_fire; broadcast stays OFF by construction "
+              "(_same_block_live() false -> _shadow_same_block logs only), no gas/kill-switch "
+              "accrual for shadow arms")
     global _predict_feed_ref, _predict_driver_ref
     _predict_feed_ref, _predict_driver_ref = feed, driver
     return feed, driver
