@@ -325,6 +325,15 @@ _HAIRCUT_DEN = 1000
 
 
 # --- state (kill-switch / dedup) ----------------------------------------------
+# _fire_lock guards EVERY mutation of the shared fire-accounting state — st["fires"],
+# st["gas_usd"], st["sent"] — and the save_state serialization snapshot. The WSS mempool
+# thread claims a same-block nonce through the equality fires_at_sign == st["fires"] under
+# this lock (_fire_same_block), so ANY unlocked mutation of these keys on the main loop could
+# tear that claim (double-spent nonce) or resize st mid-json.dump ("dictionary changed size
+# during iteration" -> process crash). Critical sections are SHORT and never do network I/O.
+_fire_lock = threading.Lock()
+
+
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         try:
@@ -336,16 +345,23 @@ def load_state() -> dict:
 
 
 def save_state(st: dict) -> None:
+    # snapshot under _fire_lock: the WSS thread mutates st["sent"]/st["fires"]/st["gas_usd"]
+    # concurrently and json.dump iterating a resizing dict kills the process. Serialization is
+    # pure CPU on a small dict (fast); the file write happens OUTSIDE the lock.
+    with _fire_lock:
+        payload = json.dumps(st)
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     tmp = STATE_FILE + ".tmp"
-    json.dump(st, open(tmp, "w"))
+    with open(tmp, "w") as f:
+        f.write(payload)
     os.replace(tmp, STATE_FILE)
 
 
 def _roll_day(st: dict, today: str) -> None:
     if st.get("day") != today:
-        st["day"] = today
-        st["gas_usd"] = 0.0
+        with _fire_lock:
+            st["day"] = today
+            st["gas_usd"] = 0.0
 
 
 # --- telegram (optional; loud preflight warning if not configured) -------------
@@ -775,7 +791,8 @@ def _settle(st: dict, key: str, txh: str, rcpt: dict, now_ts: float,
     try:   # actual gas from the receipt, not the estimate (review: gas accounting)
         actual = (int(rcpt["gasUsed"], 16) * int(rcpt.get("effectiveGasPrice", "0x0"), 16)
                   / 1e18 * ETH_USD)
-        st["gas_usd"] += actual - gas_est_usd
+        with _fire_lock:
+            st["gas_usd"] += actual - gas_est_usd
     except Exception:
         pass
     if int(rcpt.get("status", "0x0"), 16) == 1:
@@ -802,19 +819,23 @@ def _record_send_error(st: dict, key: str, now_ts: float, gas_usd: float, e, wha
     SEND_ERR_COOLDOWN_SEC (see recently_fired) and the alert is throttled per-target
     (SEND_ERR_ALERT_SEC) + globally (SEND_ERR_ALERT_GLOBAL_SEC): an unfunded wallet used to
     re-quote + re-fire + alert EVERY ~1s hot tick, per target, until topped up."""
-    st["gas_usd"] -= gas_usd
-    st["sent"][key] = {"tx": f"senderr:{e}"[:200], "ts": now_ts, "status": "send_error"}
-    seen = st.setdefault("send_err_alerted", {})
-    if (now_ts - seen.get(key, 0) > SEND_ERR_ALERT_SEC
-            and now_ts - st.get("last_send_err_alert", 0) > SEND_ERR_ALERT_GLOBAL_SEC):
-        seen[key] = now_ts
-        st["last_send_err_alert"] = now_ts
+    with _fire_lock:       # gas refund + sent-journal write share the same claim state the
+        #                    WSS same-block path reads under this lock (see save_state too)
+        st["gas_usd"] -= gas_usd
+        st["sent"][key] = {"tx": f"senderr:{e}"[:200], "ts": now_ts, "status": "send_error"}
+        seen = st.setdefault("send_err_alerted", {})
+        do_alert = (now_ts - seen.get(key, 0) > SEND_ERR_ALERT_SEC
+                    and now_ts - st.get("last_send_err_alert", 0) > SEND_ERR_ALERT_GLOBAL_SEC)
+        if do_alert:
+            seen[key] = now_ts
+            st["last_send_err_alert"] = now_ts
+        for k in [k for k, ts in seen.items() if now_ts - ts > 86400]:   # prune
+            del seen[k]
+    if do_alert:           # alert strictly OUTSIDE the lock (spawns a thread; keep it short)
         alert(f"⚠️ {what} error (not counted as revert; target cooldown "
               f"{SEND_ERR_COOLDOWN_SEC:.0f}s): {str(e)[:200]}")
     else:
         print(f"  {what} error (alert throttled): {str(e)[:200]}")
-    for k in [k for k, ts in seen.items() if now_ts - ts > 86400]:   # prune
-        del seen[k]
 
 
 def _sign_liquidate(nonce: int, max_fee: int, priority: int, calldata: str) -> str:
@@ -864,8 +885,9 @@ def _post_broadcast(t: dict, ev: dict, st: dict, now_ts: float, key: str, callda
     if not rcpt:
         # keep the loop hot: track the pending tx, settle on later passes (review H7) — a
         # receipt timeout is NOT a revert (the tx may still mine)
-        st["sent"][key] = {"tx": txh, "ts": now_ts, "status": "pending",
-                           "calldata": calldata, "gas_est": gas_usd}
+        with _fire_lock:
+            st["sent"][key] = {"tx": txh, "ts": now_ts, "status": "pending",
+                               "calldata": calldata, "gas_est": gas_usd}
         alert(f"⏳ no receipt in {RECEIPT_WAIT_SEC:.0f}s, tracking: {txh}")
         return
     outcome = _settle(st, key, txh, rcpt, now_ts, gas_usd, calldata)
@@ -895,20 +917,25 @@ def _fire_cast(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: s
 
 
 def _record(st: dict, key: str, tx: str, now_ts: float, status: str) -> None:
-    st["sent"][key] = {"tx": tx, "ts": now_ts, "status": status}
-    if status == "revert":
-        st["consec_reverts"] += 1
-        st["reverts"] += 1
-    elif status == "ok":
-        st["consec_reverts"] = 0
-    elif status == "lost_race":
-        st["races_lost"] = st.get("races_lost", 0) + 1
+    with _fire_lock:       # st["sent"] is read/written from the WSS thread too
+        st["sent"][key] = {"tx": tx, "ts": now_ts, "status": status}
+        if status == "revert":
+            st["consec_reverts"] += 1
+            st["reverts"] += 1
+        elif status == "ok":
+            st["consec_reverts"] = 0
+        elif status == "lost_race":
+            st["races_lost"] = st.get("races_lost", 0) + 1
 
 
 def _check_pending(st: dict, now_ts: float) -> None:
     """Settle still-pending txs from previous passes (review H7): reclassify once mined; after
-    10min unmined, mark stale + alert (possible stuck nonce) — never counted as a revert."""
-    for key, rec in list(st["sent"].items()):
+    10min unmined, mark stale + alert (possible stuck nonce) — never counted as a revert.
+    st["sent"] is snapshotted/mutated under _fire_lock (the WSS same-block path inserts pending
+    records concurrently); the receipt RPCs run OUTSIDE the lock."""
+    with _fire_lock:
+        items = list(st["sent"].items())
+    for key, rec in items:
         if rec.get("status") != "pending" or not str(rec.get("tx", "")).startswith("0x"):
             continue
         try:
@@ -920,12 +947,14 @@ def _check_pending(st: dict, now_ts: float) -> None:
                               rec.get("gas_est", 0.0), rec.get("calldata"))
             alert(f"📬 pending settled — {outcome}: {rec['tx']}")
         elif now_ts - rec["ts"] > 600:
-            rec["status"] = "stale"
+            with _fire_lock:
+                rec["status"] = "stale"
             alert(f"⚠️ tx unmined for 10min (stuck nonce? fee snapshot too low?): {rec['tx']}")
     # prune the journal so it can't grow unbounded
-    for key, rec in list(st["sent"].items()):
-        if now_ts - rec.get("ts", 0) > 86400:
-            del st["sent"][key]
+    with _fire_lock:
+        for key, rec in list(st["sent"].items()):
+            if now_ts - rec.get("ts", 0) > 86400:
+                del st["sent"][key]
 
 
 def fire(rpc: Rpc, t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -> None:
@@ -982,8 +1011,11 @@ def fire(rpc: Rpc, t: dict, ev: dict, st: dict, now_ts: float, gas_usd: float) -
         fire_gas_usd = GAS_UNITS_EST * bid_gwei / 1e9 * ETH_USD
         print(f"  💸 fee-bid {bid_gwei:.0f} gwei (net {nets} > ${FEE_BID_MIN_NET_USD:.0f}); "
               f"est win-cost ${fire_gas_usd:,.0f}, keeps ~${(ev['net_usd'] or 0) - fire_gas_usd:,.0f}")
-    st["fires"] += 1
-    st["gas_usd"] += fire_gas_usd
+    with _fire_lock:       # atomic vs the WSS same-block claim: its fires_at_sign ==
+        #                    st["fires"] guard must see a consistent counter (a torn/unlocked
+        #                    increment here could let both paths spend the same nonce)
+        st["fires"] += 1
+        st["gas_usd"] += fire_gas_usd
     if RAW_TX:
         _fire_raw(t, ev, st, now_ts, key, calldata, fire_gas_usd, bid_gwei)
     else:
@@ -1134,10 +1166,17 @@ def _arm_refresh(rpc: Rpc, rows: list[dict], st: dict, now_ts: float,
             try:
                 from eth_account import Account
                 addr = Account.from_key(PRIVATE_KEY).address
+                # read the fire counter under the lock BEFORE the fee/nonce RPCs + signing:
+                # if a fire (classic or same-block) claims the nonce while we're fetching/
+                # signing, fires_at_sign here no longer matches st["fires"] at fire time and
+                # the guard rejects this entry — the SAFE direction (we may drop a good arm
+                # for one window; reading AFTER could double-spend a nonce).
+                with _fire_lock:
+                    fires_at_sign = st.get("fires", 0)
                 max_fee, priority = _fee_params(entry["bid_gwei"])
                 nonce = int(_rpc_write("eth_getTransactionCount", [addr, "pending"]), 16)
                 entry["raw"] = _sign_liquidate(nonce, max_fee, priority, entry["calldata"])
-                entry["fires_at_sign"] = st.get("fires", 0)
+                entry["fires_at_sign"] = fires_at_sign
                 # the same-block layer RE-signs this calldata with the pending oracle push's
                 # matched tip, so it needs the frozen nonce + the (pinned) base fee to rebuild
                 # maxFee without an RPC in the reaction path.
@@ -1153,11 +1192,12 @@ def _arm_refresh(rpc: Rpc, rows: list[dict], st: dict, now_ts: float,
 # --- mempool same-block backrun (bot/mempool.py; runs in the WSS thread) --------------------
 # The mempool thread reads the CURRENT armed set through a lock-guarded snapshot (never _arm
 # directly — _arm_refresh mutates it across seconds of quoting) and claims a fire through
-# _fire_lock, so a same-block fire and the main loop's next-block _fire_fast can never both
-# consume the same nonce (the loser sees fires_at_sign != st['fires'] and aborts). Shadow mode
-# touches NO shared state — it only reads the snapshot and logs a MEMPOOL line.
+# _fire_lock (defined next to save_state — it guards ALL st["fires"]/st["gas_usd"]/st["sent"]
+# mutations on every thread), so a same-block fire and the main loop's next-block _fire_fast
+# can never both consume the same nonce (the loser sees fires_at_sign != st['fires'] and
+# aborts). Shadow mode touches NO shared state — it only reads the snapshot and logs a
+# MEMPOOL line.
 _arm_lock = threading.Lock()
-_fire_lock = threading.Lock()
 _arm_snapshot: dict[str, list[dict]] = {}   # marketId(lower) -> [armed entry]
 
 
@@ -1429,8 +1469,9 @@ def _fire_fast(entry: dict, st: dict, now_ts: float) -> bool:
     try:
         txh = _rpc_write("eth_sendRawTransaction", [entry["raw"]])
     except Exception as e:
-        st["fires"] -= 1                  # refund — the classic pass takes over untainted
-        st["gas_usd"] -= entry["gas_usd"]
+        with _fire_lock:                  # refund — the classic pass takes over untainted
+            st["fires"] -= 1
+            st["gas_usd"] -= entry["gas_usd"]
         entry["raw"] = None
         print(f"  fast send failed (classic path takes over): {str(e)[:160]}")
         return False

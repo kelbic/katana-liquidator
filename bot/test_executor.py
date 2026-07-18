@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import threading
 import time
 import unittest
 import urllib.parse
@@ -1502,6 +1503,321 @@ class TestRaceTelemetryAlerts(unittest.TestCase):
             ex.RACE_ALERT_MAX = save
         self.assertEqual(len(self._race_log(out)), 5)             # all 5 LOGGED
         self.assertEqual(len(self.alerts), 2)                     # capped pings
+
+
+# --- nonce-claim / state races (review A): every st["fires"]/st["gas_usd"]/st["sent"] mutation
+# must happen under _fire_lock — the WSS same-block thread claims a nonce through the equality
+# fires_at_sign == st["fires"] under that lock, and save_state json-serializes st under it.
+
+
+class _LockAudit:
+    """Records every write to the shared fire-accounting keys made WITHOUT _fire_lock held."""
+
+    def __init__(self):
+        self.violations = []
+
+    def st(self, **over):
+        audit = self
+
+        class _Sent(dict):
+            def __setitem__(s, k, v):
+                if not ex._fire_lock.locked():
+                    audit.violations.append(f"sent[{k}]=")
+                dict.__setitem__(s, k, v)
+
+            def __delitem__(s, k):
+                if not ex._fire_lock.locked():
+                    audit.violations.append(f"del sent[{k}]")
+                dict.__delitem__(s, k)
+
+        class _St(dict):
+            def __setitem__(s, k, v):
+                if k in ("fires", "gas_usd") and not ex._fire_lock.locked():
+                    audit.violations.append(f"st[{k}]=")
+                dict.__setitem__(s, k, v)
+
+        base = {"sent": _Sent(), "declined": {}, "fires": 0, "gas_usd": 0.0,
+                "consec_reverts": 0, "reverts": 0, "races_lost": 0}
+        base.update(over)
+        return _St(base)     # dict-constructor init bypasses __setitem__ (no false positives)
+
+
+class _NoOracleRpc:
+    """fire()'s pre-send oracle re-read target: raise -> the check is skipped (except: pass)."""
+
+    def eth_call(self, *a, **k):
+        raise RuntimeError("no oracle in test")
+
+
+def _fire_ev(**over):
+    ev = {"f": 1.0, "net_usd": 500.0, "net_wei": int(500e6), "repaid_shares": 1,
+          "seized_arg": 0, "impact": 0.008, "min_profit_wei": int(20e6),
+          "swap_target": "0xAC4c6e212A361c968F1725b4d055b47E63F80b75",
+          "swap_calldata": "0xdeadbeef", "loan_dec": 6, "lif": 1.04}
+    ev.update(over)
+    return ev
+
+
+class TestFireLockDiscipline(unittest.TestCase):
+    """A1: audited-dict runs of every fire/settle/journal path — zero unlocked writes to
+    st["fires"]/st["gas_usd"]/st["sent"]."""
+
+    def setUp(self):
+        self._save = (ex.DRY_RUN, ex.RAW_TX, ex._fire_raw, ex._preflight_call, ex._rpc_write,
+                      ex._post_broadcast, ex.alert, ex.RECEIPT_WAIT_SEC)
+        ex.DRY_RUN, ex.RAW_TX = False, True
+        ex.alert = lambda text, sync=False: None
+        self.audit = _LockAudit()
+
+    def tearDown(self):
+        (ex.DRY_RUN, ex.RAW_TX, ex._fire_raw, ex._preflight_call, ex._rpc_write,
+         ex._post_broadcast, ex.alert, ex.RECEIPT_WAIT_SEC) = self._save
+
+    def test_classic_fire_counts_under_lock(self):
+        fired = []
+        ex._preflight_call = lambda cd: (True, "")
+        ex._fire_raw = lambda *a, **k: fired.append(a)
+        st = self.audit.st()
+        t = _hot_row()
+        _capture(ex.fire, _NoOracleRpc(), t, _fire_ev(), st, 1000.0, 0.01)
+        self.assertEqual(len(fired), 1)
+        self.assertEqual(st["fires"], 1)
+        self.assertAlmostEqual(st["gas_usd"], 0.01)
+        self.assertEqual(self.audit.violations, [])       # the A1 regression assertion
+
+    def test_send_error_refund_and_journal_under_lock(self):
+        st = self.audit.st(gas_usd=0.5)
+        _capture(ex._record_send_error, st, "k", 1000.0, 0.5, RuntimeError("boom"), "send")
+        self.assertAlmostEqual(st["gas_usd"], 0.0)        # refunded
+        self.assertEqual(st["sent"]["k"]["status"], "send_error")
+        self.assertEqual(self.audit.violations, [])
+
+    def test_settle_and_record_under_lock(self):
+        st = self.audit.st()
+        rcpt = {"status": "0x1", "gasUsed": hex(900000), "effectiveGasPrice": hex(int(1e6))}
+        out = ex._settle(st, "k", "0x" + "ab" * 32, rcpt, 1000.0, 0.01, None)
+        self.assertEqual(out, "ok")
+        self.assertEqual(st["sent"]["k"]["status"], "ok")
+        self.assertEqual(self.audit.violations, [])
+
+    def test_post_broadcast_pending_record_under_lock(self):
+        ex.RECEIPT_WAIT_SEC = 0.0                          # skip the receipt wait entirely
+        ex._rpc_write = lambda m, p, timeout=15.0: None
+        st = self.audit.st()
+        t = _hot_row()
+        _capture(ex._post_broadcast, t, _fire_ev(), st, 1000.0, "k", "0x79", 0.01,
+                 "0x" + "ab" * 32)
+        self.assertEqual(st["sent"]["k"]["status"], "pending")
+        self.assertEqual(self.audit.violations, [])
+
+    def test_check_pending_settle_and_prune_under_lock(self):
+        rcpt = {"status": "0x1", "gasUsed": "0x1", "effectiveGasPrice": "0x1"}
+        ex._rpc_write = lambda m, p, timeout=15.0: rcpt
+        st = self.audit.st()
+        now = 100000.0
+        with ex._fire_lock:
+            st["sent"]["mined"] = {"tx": "0x" + "aa" * 32, "ts": now - 5, "status": "pending"}
+            st["sent"]["old"] = {"tx": "done", "ts": now - 90000, "status": "ok"}
+        _capture(ex._check_pending, st, now)
+        self.assertEqual(st["sent"]["mined"]["status"], "ok")   # settled
+        self.assertNotIn("old", st["sent"])                     # pruned
+        self.assertEqual(self.audit.violations, [])
+
+    def test_fire_fast_send_and_refund_under_lock(self):
+        ex._post_broadcast = lambda *a: None
+        sent = []
+        ex._rpc_write = lambda m, p, timeout=15.0: sent.append(p[0]) or "0x" + "ab" * 32
+        st = self.audit.st()
+        self.assertTrue(ex._fire_fast(_arm_entry(), st, 1000.0))
+        self.assertEqual(st["fires"], 1)
+
+        def boom(m, p, timeout=15.0):
+            raise ex.RpcTransportError("down")
+        ex._rpc_write = boom                               # refund path
+        st2 = self.audit.st(fires=1)
+        e2 = _arm_entry(fires_at_sign=1)
+        _capture(ex._fire_fast, e2, st2, 1000.0)
+        self.assertEqual(st2["fires"], 1)                  # claim + refund cancelled out
+        self.assertEqual(self.audit.violations, [])
+
+
+class TestNonceClaimRaces(unittest.TestCase):
+    """A1: concurrent same-block (WSS thread) vs next-block fast path — exactly ONE of them may
+    spend the nonce; the loser aborts on fires_at_sign != st['fires'] under _fire_lock."""
+
+    def setUp(self):
+        self._save = (ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE, ex.DRY_RUN, ex.CONTRACT,
+                      ex.FEE_BID, ex._sign_liquidate, ex._mempool_send_raw, ex._rpc_write,
+                      ex._post_broadcast, ex.alert)
+        ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE = True, False, True
+        ex.DRY_RUN, ex.CONTRACT, ex.FEE_BID = False, "0x" + "be" * 20, False
+        ex._sign_liquidate = lambda nonce, max_fee, prio, cd: f"0xsigned_{nonce}_{prio}"
+        ex._post_broadcast = lambda *a: None
+        ex.alert = lambda *a, **k: None
+
+    def tearDown(self):
+        (ex.MEMPOOL, ex.MEMPOOL_SHADOW, ex.MEMPOOL_LIVE, ex.DRY_RUN, ex.CONTRACT,
+         ex.FEE_BID, ex._sign_liquidate, ex._mempool_send_raw, ex._rpc_write,
+         ex._post_broadcast, ex.alert) = self._save
+
+    def _st(self):
+        return {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0,
+                "consec_reverts": 0, "reverts": 0}
+
+    def test_same_block_claim_wins_fast_path_aborts(self):
+        e, st = _arm_entry(), self._st()
+        mp_sent, fast_sent = [], []
+        started, release = threading.Event(), threading.Event()
+
+        def mp_send(raw, timeout=8.0):                     # blocks mid-send, OUTSIDE the lock
+            mp_sent.append(raw)
+            started.set()
+            release.wait(2.0)
+            return "0x" + "cd" * 32
+        ex._mempool_send_raw = mp_send
+        ex._rpc_write = lambda m, p, timeout=15.0: fast_sent.append(p[0]) or "0x" + "ab" * 32
+        thr = threading.Thread(target=lambda: _capture(ex._fire_same_block, e, _sig(e), st),
+                               daemon=True)
+        thr.start()
+        self.assertTrue(started.wait(2.0))                 # WSS thread claimed, now sending
+        res = ex._fire_fast(e, st, time.time())            # concurrent next-block attempt
+        release.set()
+        thr.join(2.0)
+        self.assertFalse(thr.is_alive())
+        self.assertFalse(res)                              # loser aborted BEFORE any send
+        self.assertEqual(fast_sent, [])
+        self.assertEqual(len(mp_sent), 1)                  # exactly one nonce spend
+        self.assertEqual(st["fires"], 1)
+        self.assertEqual(st["sent"][e["key"]]["status"], "pending")
+
+    def test_fast_claim_wins_same_block_aborts(self):
+        e, st = _arm_entry(), self._st()
+        mp_sent, fast_sent = [], []
+        started, release = threading.Event(), threading.Event()
+
+        def fast_send(m, p, timeout=15.0):                 # blocks mid-send, OUTSIDE the lock
+            fast_sent.append(p[0])
+            started.set()
+            release.wait(2.0)
+            return "0x" + "ab" * 32
+        ex._rpc_write = fast_send
+        ex._mempool_send_raw = lambda raw, timeout=8.0: mp_sent.append(raw) or "0x" + "cd" * 32
+        thr = threading.Thread(target=lambda: ex._fire_fast(e, st, time.time()), daemon=True)
+        thr.start()
+        self.assertTrue(started.wait(2.0))                 # fast path claimed, now sending
+        res = _capture(ex._fire_same_block, e, _sig(e), st)
+        release.set()
+        thr.join(2.0)
+        self.assertFalse(thr.is_alive())
+        self.assertEqual(mp_sent, [])                      # same-block saw the burned counter
+        self.assertEqual(len(fast_sent), 1)
+        self.assertEqual(st["fires"], 1)
+        self.assertNotIn("live_fire", res)
+
+
+class TestArmCounterReadOrder(unittest.TestCase):
+    """A2: _arm_refresh must read st['fires'] (under _fire_lock) BEFORE the nonce RPC — a fire
+    landing during eth_getTransactionCount/signing must invalidate the entry, never validate it."""
+
+    def setUp(self):
+        self._save = (ex.DRY_RUN, ex.quote, ex.FEE_BID, ex.BLIND_FIRE, ex.PRIVATE_KEY,
+                      ex._preflight_call, ex._rpc_write, ex.alert)
+        ex._arm.clear()
+        ex.DRY_RUN, ex.BLIND_FIRE, ex.FEE_BID = False, True, False
+        ex.PRIVATE_KEY = "0x" + "01" * 32
+        ex.quote = _stub_quote(out_per_btc=61500, impact=0.008)
+        ex.alert = lambda text, sync=False: None
+        ex._preflight_call = lambda cd: (False, "execution reverted: position is healthy")
+
+    def tearDown(self):
+        (ex.DRY_RUN, ex.quote, ex.FEE_BID, ex.BLIND_FIRE, ex.PRIVATE_KEY,
+         ex._preflight_call, ex._rpc_write, ex.alert) = self._save
+        ex._arm.clear()
+
+    def test_fire_during_nonce_rpc_invalidates_entry(self):
+        st = {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0,
+              "consec_reverts": 0, "reverts": 0}
+
+        def rpc_write(m, p, timeout=15.0):
+            if m == "eth_getBlockByNumber":
+                return {"baseFeePerGas": hex(1_000_000)}
+            if m == "eth_getTransactionCount":
+                with ex._fire_lock:                        # a same-block fire lands mid-arm
+                    st["fires"] += 1
+                return "0x7"
+            return "0x" + "ab" * 32
+        ex._rpc_write = rpc_write
+        row = _hot_row()
+        _capture(ex._arm_refresh, _ArmRpc(), [row], st, 1000.0, time.monotonic() + 5)
+        e = ex._arm[f"{row['market_id']}:{row['borrower']}"]
+        self.assertTrue(str(e["raw"]).startswith("0x"))    # signed as usual...
+        self.assertEqual(e["fires_at_sign"], 0)            # ...but the counter is the PRE-read
+        self.assertNotEqual(e["fires_at_sign"], st["fires"])   # safe direction: guard rejects
+        # neither fire path may spend this (possibly stale) nonce now
+        sent = []
+        ex._rpc_write = lambda m, p, timeout=15.0: sent.append(p[0]) or "0x" + "ab" * 32
+        self.assertFalse(ex._fire_fast(e, st, 1000.0))
+        self.assertEqual(sent, [])
+
+
+class TestSaveStateLocking(unittest.TestCase):
+    """A3: save_state snapshots st under _fire_lock (file write outside the lock)."""
+
+    def test_snapshot_taken_under_fire_lock(self):
+        import tempfile
+        save_lock, save_file = ex._fire_lock, ex.STATE_FILE
+        acq = {"n": 0}
+
+        class _Probe:
+            def __enter__(self):
+                acq["n"] += 1
+
+            def __exit__(self, *a):
+                return False
+
+            def locked(self):
+                return False
+        with tempfile.TemporaryDirectory() as d:
+            ex._fire_lock, ex.STATE_FILE = _Probe(), os.path.join(d, "st.json")
+            try:
+                ex.save_state({"sent": {"k": 1}, "fires": 2})
+            finally:
+                ex._fire_lock, ex.STATE_FILE = save_lock, save_file
+            with open(os.path.join(d, "st.json")) as f:
+                self.assertEqual(json.load(f), {"sent": {"k": 1}, "fires": 2})
+        self.assertEqual(acq["n"], 1)
+
+    def test_concurrent_sent_mutation_never_crashes_save(self):
+        # A3 regression: json.dump used to iterate st directly while the WSS thread resized
+        # st["sent"] -> "dictionary changed size during iteration" crashed the whole process.
+        import tempfile
+        save_file = ex.STATE_FILE
+        st = {"sent": {}, "fires": 0, "gas_usd": 0.0}
+        stop = threading.Event()
+
+        def mutate():
+            i = 0
+            while not stop.is_set():
+                with ex._fire_lock:                        # insert+delete: resize churn on
+                    st["sent"][f"k{i}"] = {"ts": i, "status": "pending"}   # every iteration,
+                    st["sent"].pop(f"k{i - 50}", None)     # bounded size (fast json payload)
+                i += 1
+        thr = threading.Thread(target=mutate, daemon=True)
+        errs = []
+        with tempfile.TemporaryDirectory() as d:
+            ex.STATE_FILE = os.path.join(d, "st.json")
+            thr.start()
+            try:
+                for _ in range(200):
+                    try:
+                        ex.save_state(st)
+                    except RuntimeError as e:              # the old crash mode
+                        errs.append(str(e))
+            finally:
+                stop.set()
+                thr.join(2.0)
+                ex.STATE_FILE = save_file
+        self.assertEqual(errs, [])
 
 
 if __name__ == "__main__":
