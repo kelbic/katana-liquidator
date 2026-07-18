@@ -96,7 +96,8 @@ from analysis.protocols import MARKETS, MORPHO, STABLES, TOKENS        # noqa: E
 from analysis.rpc import DEFAULT_RPCS, Rpc                             # noqa: E402
 from bot import fastpath                                               # noqa: E402
 from bot import oracles                                               # noqa: E402
-from bot.sushi import quote, NoRouteError, SWAP_INPUT_HAIRCUT         # noqa: E402
+from bot.sushi import (quote, NoRouteError, PartialRouteError,        # noqa: E402
+                       SWAP_INPUT_HAIRCUT)
 
 # --- config -------------------------------------------------------------------
 CONTRACT = os.environ.get("KT_CONTRACT", "")
@@ -508,6 +509,38 @@ def refresh_eth_usd() -> None:
         print(f"eth_usd refresh fail: {e}")
 
 
+# --- Sushi 'Partial' memo (review B) ------------------------------------------
+# status=Partial means the router can fill only PART of amountIn — persistent for a given
+# (pair, size) (route liquidity), NOT a transient error. Re-quoting the same too-big sizes
+# every pass burned the whole arm-window idle budget on doomed round-trips (the weETH/vbETH
+# cluster's "quote fail ... Partial" / "evaluate deadline exceeded" storm) and the armed entry
+# was never built. Remember, per (coll, loan), the SMALLEST amountIn seen Partial (any larger
+# amount is Partial a fortiori) for DECLINE_TTL: known-too-big fractions are skipped for FREE
+# so the chunk ladder reaches a fillable size inside the deadline. The partial output itself
+# is NEVER used as a full fill — economics are untouched, this only skips doomed round-trips.
+# Main-thread only (evaluate runs in the main loop's classic + arm paths).
+_partial_floor: dict[tuple[str, str], tuple[int, float]] = {}   # (coll,loan)->(min_amt, expiry)
+
+
+def _partial_note(coll: str, loan: str, amount_in: int) -> None:
+    k = (coll.lower(), loan.lower())
+    cur = _partial_floor.get(k)
+    amt = amount_in if cur is None or time.time() > cur[1] else min(cur[0], amount_in)
+    _partial_floor[k] = (amt, time.time() + DECLINE_TTL)
+
+
+def _partial_known(coll: str, loan: str, amount_in: int) -> bool:
+    """True if a recent quote proved the router cannot fully fill amount_in (or less) for this
+    pair — skip the round-trip; a smaller fraction may still route."""
+    cur = _partial_floor.get((coll.lower(), loan.lower()))
+    if cur is None:
+        return False
+    if time.time() > cur[1]:
+        del _partial_floor[(coll.lower(), loan.lower())]    # expired — re-probe
+        return False
+    return amount_in >= cur[0]
+
+
 # --- evaluate: size the exit against a live Sushi quote (chunking) ------------
 def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = None) -> dict | None:
     """Quote the exit for target `t` (a monitor scan row), chunking down until the net clears
@@ -552,6 +585,9 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = No
         else:
             seized_arg = 0
             amount_in = seized * _HAIRCUT_NUM // _HAIRCUT_DEN
+        if _partial_known(coll, loan, amount_in):
+            continue    # recent Partial at >= this size: no full route — free skip (no network),
+            #             the ladder descends to a fillable fraction inside the deadline
         # arm path (deadline_mono set): cap the quote timeout to the idle budget left and take
         # ONE shot, so a slow/Partial quote can never outlive the armed window. Classic path
         # (deadline_mono is None) keeps the full QUOTE_TIMEOUT + QUOTE_RETRIES.
@@ -570,6 +606,17 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = No
         except NoRouteError:
             # no route at any size (dead/exotic collateral, e.g. yUSD) — skip this target
             return None
+        except PartialRouteError as e:
+            # the router can fill only PART of this amount — NOT transient for the size: cache
+            # the floor so this and larger fractions are skipped for DECLINE_TTL and the ladder
+            # spends its budget on sizes that can actually fill. The partial output is NEVER
+            # treated as a full fill (no row is built from this quote).
+            _partial_note(coll, loan, amount_in)
+            print(f"    quote partial f={num}/{den}: {e} (size cached {DECLINE_TTL:.0f}s)")
+            if time.monotonic() > deadline:
+                print("    evaluate deadline exceeded, giving up this pass")
+                return None
+            continue
         except Exception as e:
             print(f"    quote fail f={num}/{den}: {e}")
             if time.monotonic() > deadline:
@@ -1128,8 +1175,14 @@ def _arm_refresh(rpc: Rpc, rows: list[dict], st: dict, now_ts: float,
             print(f"  arm {t['borrower'][:10]}…: {str(err)[:120]}")
             continue
         if not ev:
-            if time.monotonic() > deadline_mono:
-                continue    # the idle BUDGET stopped it, not economics — retry next window
+            if time.monotonic() > deadline_mono - QUOTE_MIN_TIMEOUT:
+                # the idle BUDGET stopped it, not economics — retry next window. Includes the
+                # below-one-quote floor stop (evaluate breaks with < QUOTE_MIN_TIMEOUT left,
+                # i.e. BEFORE deadline_mono): 60s-banning the target there froze the chunk
+                # ladder exactly on the Partial-heavy weETH/vbETH cluster — the next windows,
+                # with the known-Partial sizes now skipped for free, descend further and build
+                # the armed entry from the first fillable fraction.
+                continue
             # same verdict evaluate() gives flipped targets (no profitable chunk/no route).
             # NOT st['declined'] — the target hasn't flipped; a local skip TTL instead.
             _arm[key] = {"skip_until": now_ts + DECLINE_TTL}

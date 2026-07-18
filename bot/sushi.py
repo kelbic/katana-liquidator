@@ -40,6 +40,15 @@ class NoRouteError(SushiError):
     error for an unsupported/dust token). The caller should skip the target, not chunk down."""
 
 
+class PartialRouteError(SushiError):
+    """Sushi found a route covering only PART of amountIn (status 'Partial'): route liquidity
+    can't fill this size, so assumedAmountOut/tx.data describe the PARTIAL fill only and must
+    NEVER be used as a full-amount exit (executing it would swap a fraction of the seized
+    collateral while the profit math assumed all of it). NOT transient for a given (pair, size)
+    — retrying the same amount just burns another round-trip (the weETH/vbETH cluster returns
+    Partial persistently at large sizes); the caller should try a SMALLER size instead."""
+
+
 def quote(token_in: str, token_out: str, amount_in_wei: int, sender: str, recipient: str,
           max_slippage: float = 0.005, timeout: float = 30.0, retries: int = 3) -> dict:
     """One Sushi v7 quote. Returns a normalised dict:
@@ -48,7 +57,9 @@ def quote(token_in: str, token_out: str, amount_in_wei: int, sender: str, recipi
     `recipient` (to) is baked into the calldata — for the liquidation callback it MUST be the
     KatanaLiquidator contract so the swapped loanToken lands there for Morpho to pull.
     Raises NoRouteError (no retry) when there is no route / an unsupported token (status 'NoWay'
-    or HTTP 4xx) — retrying those is pointless. Retries only transient network/5xx errors."""
+    or HTTP 4xx) and PartialRouteError (no retry) when the route can only fill part of this
+    amount (status 'Partial' — try a smaller size, never treat the partial output as full) —
+    retrying those is pointless. Retries only transient network/5xx errors."""
     params = {
         "tokenIn": token_in, "tokenOut": token_out, "amount": str(int(amount_in_wei)),
         "maxSlippage": str(max_slippage), "sender": sender, "to": recipient,
@@ -64,6 +75,10 @@ def quote(token_in: str, token_out: str, amount_in_wei: int, sender: str, recipi
                 # NoWay = no route at all; treat as fail-fast so the caller skips the target.
                 if d.get("status") == "NoWay":
                     raise NoRouteError("no route (NoWay)")
+                # Partial = route fills only part of this amount; fail fast (never retry —
+                # deterministic for the size) so the caller chunks DOWN instead of re-quoting.
+                if d.get("status") == "Partial":
+                    raise PartialRouteError("partial route (no full-fill route at this size)")
                 raise SushiError(f"status={d.get('status')} {str(d)[:160]}")
             tx = d.get("tx") or {}
             return {

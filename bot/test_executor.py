@@ -1505,6 +1505,142 @@ class TestRaceTelemetryAlerts(unittest.TestCase):
         self.assertEqual(len(self.alerts), 2)                     # capped pings
 
 
+# --- Sushi 'Partial' handling (review B): a Partial verdict is deterministic for the (pair,
+# size) — cache it (DECLINE_TTL) so the chunk ladder skips known-too-big sizes for free and
+# reaches a fillable fraction inside the arm deadline; never treat partial output as full.
+
+
+def _partial_quote(min_fill_btc, out_per_btc=63000, impact=0.008, latency=0.0, calls=None):
+    """Quote stub mimicking the weETH/vbETH cluster: amounts ABOVE min_fill_btc only route
+    partially (raises PartialRouteError); smaller amounts fill fully and profitably."""
+    def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005, **kw):
+        if calls is not None:
+            calls.append(amount_in_wei)
+        if latency:
+            time.sleep(latency)
+        if amount_in_wei > min_fill_btc * 1e8:
+            raise ex.PartialRouteError("partial route (no full-fill route at this size)")
+        return {"amount_out": int(amount_in_wei / 1e8 * out_per_btc * 1e6), "price_impact":
+                impact, "gas": 400000, "swap_target": "0x" + "ac" * 20, "swap_calldata": "0xbeef"}
+    return q
+
+
+class TestEvaluatePartialRoute(unittest.TestCase):
+    def setUp(self):
+        self._orig = ex.quote
+        ex._partial_floor.clear()
+
+    def tearDown(self):
+        ex.quote = self._orig
+        ex._partial_floor.clear()
+
+    def test_partial_descends_ladder_and_never_uses_partial_output(self):
+        calls = []
+        ex.quote = _partial_quote(min_fill_btc=0.40, calls=calls)   # full/0.75/0.5 -> Partial
+        t = _target(1.0, 61000.0)
+        ev = _capture_ret(ex.evaluate, None, t, gas_usd=0.01)
+        self.assertIsNotNone(ev)
+        self.assertLessEqual(ev["f"], 0.40)               # first fillable fraction won
+        # the Partial responses' outputs were never turned into a row/entry: proceeds scale
+        # with the FILLED amount only (0.35 chunk), not any partial fill of a larger chunk
+        self.assertEqual(ev["proceeds"],
+                         int(int(1e8 * 0.35) * ex._HAIRCUT_NUM // ex._HAIRCUT_DEN
+                             / 1e8 * 63000 * 1e6))
+
+    def test_partial_sizes_cached_next_pass_skips_them_for_free(self):
+        calls1 = []
+        ex.quote = _partial_quote(0.40, calls=calls1)
+        t = _target(1.0, 61000.0)
+        _capture_ret(ex.evaluate, None, t, gas_usd=0.01)
+        n_partial_probes = len([a for a in calls1 if a > 0.40e8])
+        self.assertGreater(n_partial_probes, 0)           # first pass had to discover them
+        calls2 = []
+        ex.quote = _partial_quote(0.40, calls=calls2)
+        ev = _capture_ret(ex.evaluate, None, t, gas_usd=0.01)
+        self.assertIsNotNone(ev)
+        self.assertEqual([a for a in calls2 if a > 0.40e8], [])   # ZERO doomed round-trips
+        self.assertLess(len(calls2), len(calls1))
+
+    def test_partial_cache_expires_and_reprobes(self):
+        ex.quote = _partial_quote(0.40)
+        t = _target(1.0, 61000.0)
+        _capture_ret(ex.evaluate, None, t, gas_usd=0.01)
+        self.assertTrue(ex._partial_floor)
+        k = next(iter(ex._partial_floor))
+        ex._partial_floor[k] = (ex._partial_floor[k][0], time.time() - 1)   # force-expire
+        calls = []
+        ex.quote = _partial_quote(0.40, calls=calls)
+        _capture_ret(ex.evaluate, None, t, gas_usd=0.01)
+        self.assertTrue([a for a in calls if a > 0.40e8])  # expired -> probed the size again
+
+    def test_smaller_pair_amount_not_blocked_by_floor(self):
+        # the floor only blocks amounts >= the smallest seen-Partial amount
+        ex._partial_note(VBWBTC, VBUSDC, int(0.5e8))
+        self.assertTrue(ex._partial_known(VBWBTC, VBUSDC, int(0.6e8)))
+        self.assertTrue(ex._partial_known(VBWBTC, VBUSDC, int(0.5e8)))
+        self.assertFalse(ex._partial_known(VBWBTC, VBUSDC, int(0.4e8)))
+        self.assertFalse(ex._partial_known(VBUSDC, VBWBTC, int(0.6e8)))   # other pair untouched
+
+
+class TestArmWindowPartialConvergence(unittest.TestCase):
+    """B acceptance: with the Partial-heavy flagship pair, successive arm windows (tight idle
+    budgets) must converge to an armed entry instead of burning every window on re-quoted
+    Partial sizes + a DECLINE_TTL self-ban."""
+
+    def setUp(self):
+        self._save = (ex.DRY_RUN, ex.quote, ex.FEE_BID, ex.BLIND_FIRE, ex.alert)
+        ex._arm.clear()
+        ex._partial_floor.clear()
+        ex.DRY_RUN, ex.BLIND_FIRE, ex.FEE_BID = True, True, False
+        ex.alert = lambda text, sync=False: None
+
+    def tearDown(self):
+        (ex.DRY_RUN, ex.quote, ex.FEE_BID, ex.BLIND_FIRE, ex.alert) = self._save
+        ex._arm.clear()
+        ex._partial_floor.clear()
+
+    def test_budget_stop_after_partials_is_not_a_decline(self):
+        # window 1: the two big fractions burn the whole budget on Partial round-trips ->
+        # evaluate stops on the below-one-quote floor. That is a BUDGET stop, not economics:
+        # the target must NOT be skip_until-banned (the old behaviour froze the ladder).
+        ex.quote = _partial_quote(0.40, latency=0.30)
+        row = _hot_row()
+        key = f"{row['market_id']}:{row['borrower']}"
+        _capture(ex._arm_refresh, _ArmRpc(), [row], self._st(), 1000.0,
+                 time.monotonic() + 0.75)                  # fits ~2 slow quotes
+        e = ex._arm.get(key)
+        self.assertTrue(e is None or "skip_until" not in e,
+                        f"budget-stopped window must not 60s-ban the target: {e}")
+        self.assertTrue(ex._partial_floor)                 # ...but the Partial sizes were noted
+
+    def test_windows_converge_to_armed_entry(self):
+        row = _hot_row()
+        key = f"{row['market_id']}:{row['borrower']}"
+        st = self._st()
+        for _ in range(4):                                 # a few ~0.75s idle windows
+            ex.quote = _partial_quote(0.40, latency=0.30)
+            _capture(ex._arm_refresh, _ArmRpc(), [row], st, 1000.0,
+                     time.monotonic() + 0.75)
+            e = ex._arm.get(key)
+            self.assertTrue(e is None or "skip_until" not in e)
+            if e and e.get("ev"):
+                break
+        e = ex._arm.get(key)
+        self.assertIsNotNone(e, "no armed entry after 4 windows")
+        self.assertIsNotNone(e.get("ev"), "no armed entry after 4 windows")
+        self.assertLessEqual(e["ev"]["f"], 0.40)           # built from a fillable fraction
+
+    def _st(self):
+        return {"sent": {}, "declined": {}, "fires": 0, "gas_usd": 0.0,
+                "consec_reverts": 0, "reverts": 0}
+
+
+def _capture_ret(fn, *a, **k):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        return fn(*a, **k)
+
+
 # --- nonce-claim / state races (review A): every st["fires"]/st["gas_usd"]/st["sent"] mutation
 # must happen under _fire_lock — the WSS same-block thread claims a nonce through the equality
 # fires_at_sign == st["fires"] under that lock, and save_state json-serializes st under it.
