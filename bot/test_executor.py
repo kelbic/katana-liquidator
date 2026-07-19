@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import sys
 import threading
 import time
 import unittest
@@ -2115,7 +2116,17 @@ class TestBotTagPrefix(unittest.TestCase):
         def fake_urlopen(req, timeout=None):
             self.sent.append(urllib.parse.parse_qs(req.data.decode())["text"][0])
             return io.BytesIO(b"{}")
-        return mock.patch.object(urllib.request, "urlopen", fake_urlopen)
+
+        @contextlib.contextmanager
+        def _cm():
+            # Opt back in past _tg_muted(): the transport below is a FAKE, and these tests exist
+            # to check the alert TEXT itself. Scoped to this helper and restored on exit
+            # (patch.dict drops the key again) — every OTHER test in the suite stays muted by
+            # default, which is the whole point of the guard.
+            with mock.patch.dict(os.environ, {"KT_MUTE_TG": "0"}), \
+                 mock.patch.object(urllib.request, "urlopen", fake_urlopen):
+                yield
+        return _cm()
 
     def test_alert_text_is_tagged(self):
         with self._capture():
@@ -2133,6 +2144,74 @@ class TestBotTagPrefix(unittest.TestCase):
             while time.time() < deadline and len(self.sent) < 3:
                 time.sleep(0.01)
         self.assertEqual(self.sent, [f"[{ex.BOT_TAG}] hello"] * 3)
+
+
+class TestTelegramMuteGuard(unittest.TestCase):
+    """THE 19.07 INCIDENT (hyperlend, same defect class): a test run posted fixtures into the
+    operator's live Telegram — borrower `0xabababab…`, tx `0xffff…ffff`, and the literal string
+    'not-an-address'. The transport must refuse while any test module of this repo is loaded,
+    WITHOUT the test having to remember a stub."""
+
+    def _muted_modules(self):
+        """Every sys.modules entry _tg_muted() treats as a test-run signal."""
+        out = {}
+        for name, mod in list(sys.modules.items()):
+            if name.startswith(("bot.test_", "analysis.test_", "tests.test_")):
+                out[name] = mod
+            elif name.startswith("test_"):
+                f = getattr(mod, "__file__", None) or ""
+                if f.startswith(ex.REPO + os.sep):
+                    out[name] = mod
+        return out
+
+    def test_a_test_run_can_never_reach_the_real_chat(self):
+        """The last line of defence: if this goes red, some test is one forgotten stub away from
+        spamming a human."""
+        hit = []
+
+        def exploding_urlopen(req, timeout=None):
+            hit.append(req)
+            raise AssertionError("a test reached the REAL Telegram transport")
+
+        o_open, o_chat, o_tok = urllib.request.urlopen, ex.CHAT_ID, ex._TG_TOKEN
+        o_mute = os.environ.pop("KT_MUTE_TG", None)     # rely on auto-detect, not the env
+        urllib.request.urlopen = exploding_urlopen
+        ex.CHAT_ID, ex._TG_TOKEN = "-100123", "tok"     # credentials present: only the guard stops it
+        try:
+            ex.alert("\U0001f52b LIQUIDATE HF=0.9500 0xabababab…, sent: 0x" + "f" * 64, sync=True)
+            ex.alert("⚠️ send error … Got: 'not-an-address'")      # daemon-thread path
+            deadline = time.time() + 2.0
+            while time.time() < deadline and not hit:
+                time.sleep(0.01)
+        finally:
+            urllib.request.urlopen, ex.CHAT_ID, ex._TG_TOKEN = o_open, o_chat, o_tok
+            if o_mute is not None:
+                os.environ["KT_MUTE_TG"] = o_mute
+        self.assertFalse(hit, "the mute guard let a test message through to Telegram")
+
+    def test_mute_guard_does_not_gag_production(self):
+        """The guard must not become an outage: with no test module loaded and no override,
+        alerts still go out. BOTH detection inputs are cleared — clearing only sys.modules would
+        let the test fool itself, since the runner is itself a test_*.py file."""
+        o_mute = os.environ.pop("KT_MUTE_TG", None)
+        o_mods = self._muted_modules()
+        for m in o_mods:
+            del sys.modules[m]
+        main = sys.modules.get("__main__")
+        o_file = getattr(main, "__file__", None)
+        if main is not None:
+            main.__file__ = "/opt/bot/executor.py"
+        try:
+            self.assertIs(ex._tg_muted(), False, "production would be silenced")
+        finally:
+            sys.modules.update(o_mods)
+            if main is not None:
+                if o_file is None:
+                    del main.__file__
+                else:
+                    main.__file__ = o_file
+            if o_mute is not None:
+                os.environ["KT_MUTE_TG"] = o_mute
 
 
 if __name__ == "__main__":

@@ -428,8 +428,49 @@ def _tg_token() -> str:
     return _TG_TOKEN
 
 
+def _tg_muted() -> bool:
+    """True when the Telegram transport must stay shut.
+
+    19.07 (hyperlend, same defect class): a test run posted FIXTURES into the operator's live
+    chat — borrower `0xabababab…`, tx `0xffff…ffff`, and the literal string 'not-an-address'.
+    The suites exercise fire() and the pending-check, both of which alert; the defence was a stub
+    each test had to remember, so the first test that forgot one reached a human.
+
+    A stub per test cannot hold that line — the guard belongs at the transport, where forgetting
+    is impossible. Default is SAFE: if any test module of this repo is loaded, the transport is
+    off unless a caller explicitly opts back in.
+
+    KT_MUTE_TG: "1" = always mute, "0" = explicit opt-in (only alert-TEXT tests, which have
+    already replaced urlopen with a fake), unset = auto-detect."""
+    forced = os.environ.get("KT_MUTE_TG")
+    if forced == "1":
+        return True
+    if forced == "0":
+        return False
+    # `python3 -m bot.test_executor` loads the suite as __main__, NOT under its dotted name — a
+    # sys.modules scan alone MISSES this repo's own runners, which is exactly how the fixtures
+    # got out. Check both: the entry point's filename, and imported test modules.
+    main_file = os.path.basename(getattr(sys.modules.get("__main__"), "__file__", "") or "")
+    if main_file.startswith("test_"):
+        return True
+    for name, mod in list(sys.modules.items()):
+        if name.startswith(("bot.test_", "analysis.test_", "tests.test_")):
+            return True
+        # A pytest run would import tests as TOP-LEVEL modules, matching none of the dotted
+        # prefixes. Accept a bare test_* only when its file lives in THIS repo, so an unrelated
+        # third-party module can never silence production.
+        if name.startswith("test_"):
+            f = getattr(mod, "__file__", None) or ""
+            if f.startswith(REPO + os.sep):
+                return True
+    return False
+
+
 def _alert_send(text: str, timeout: float = 5.0) -> None:
     text = _tagged(text)
+    if _tg_muted():
+        print(f"[tg muted] {text}")
+        return
     token = _tg_token()
     if not token or not CHAT_ID:
         print(f"[alert disabled] {text}")
