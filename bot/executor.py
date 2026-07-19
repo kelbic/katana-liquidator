@@ -398,7 +398,17 @@ def _roll_day(st: dict, today: str) -> None:
 
 
 # --- telegram (optional; loud preflight warning if not configured) -------------
+# The whole liquidator fleet posts into ONE Telegram chat, so every outgoing alert carries a
+# short bot tag — without it a "🔫 sent 1 fill …" line is unattributable.
+BOT_TAG = os.environ.get("KT_BOT_TAG", "katana")
 _TG_TOKEN: str | None = None
+
+
+def _tagged(text: str) -> str:
+    """Prefix an alert with the bot tag. Applied ONLY at the single send point (_alert_send) so
+    no caller can double-tag; idempotent anyway, so a pre-tagged text passes through unchanged."""
+    pre = f"[{BOT_TAG}]"
+    return text if text.startswith(pre) else f"{pre} {text}"
 
 
 def _tg_token() -> str:
@@ -419,6 +429,7 @@ def _tg_token() -> str:
 
 
 def _alert_send(text: str, timeout: float = 5.0) -> None:
+    text = _tagged(text)
     token = _tg_token()
     if not token or not CHAT_ID:
         print(f"[alert disabled] {text}")

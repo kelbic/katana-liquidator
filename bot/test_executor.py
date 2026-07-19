@@ -8,6 +8,8 @@ import threading
 import time
 import unittest
 import urllib.parse
+import urllib.request
+from unittest import mock
 
 os.environ.setdefault("DRY_RUN", "1")
 os.environ.setdefault("KT_MIN_PROFIT_USD", "20")
@@ -2065,6 +2067,43 @@ class TestSaveStateLocking(unittest.TestCase):
                 thr.join(2.0)
                 ex.STATE_FILE = save_file
         self.assertEqual(errs, [])
+
+
+class TestBotTagPrefix(unittest.TestCase):
+    """Every outgoing alert carries the bot tag: the whole fleet posts into ONE Telegram chat,
+    so an untagged "🔫 sent 1 fill …" line cannot be attributed to a bot. The tag is stamped at
+    the single send point (_alert_send), never by callers -> it can never be applied twice."""
+
+    def setUp(self):
+        self._save = (ex.CHAT_ID, ex._TG_TOKEN)
+        ex.CHAT_ID, ex._TG_TOKEN = "-100123", "tok"
+        self.sent = []
+
+    def tearDown(self):
+        ex.CHAT_ID, ex._TG_TOKEN = self._save
+
+    def _capture(self):
+        def fake_urlopen(req, timeout=None):
+            self.sent.append(urllib.parse.parse_qs(req.data.decode())["text"][0])
+            return io.BytesIO(b"{}")
+        return mock.patch.object(urllib.request, "urlopen", fake_urlopen)
+
+    def test_alert_text_is_tagged(self):
+        with self._capture():
+            ex.alert("🔫 sent 1 fill 0x5D561ac0", sync=True)
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.sent[0].startswith(f"[{ex.BOT_TAG}] "), self.sent[0])
+        self.assertIn("🔫 sent 1 fill 0x5D561ac0", self.sent[0])
+
+    def test_tag_applied_once_through_wrappers(self):
+        with self._capture():
+            ex.alert("hello", sync=True)                  # sync path
+            ex._alert_send(ex._tagged("hello"))           # pre-tagged text must not double up
+            ex.alert("hello")                             # fire-and-forget thread path
+            deadline = time.time() + 3.0
+            while time.time() < deadline and len(self.sent) < 3:
+                time.sleep(0.01)
+        self.assertEqual(self.sent, [f"[{ex.BOT_TAG}] hello"] * 3)
 
 
 if __name__ == "__main__":
