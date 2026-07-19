@@ -523,9 +523,19 @@ def _race_bonus_usd(lq: dict) -> float | None:
 
 
 def _race_reason(lq: dict, bonus_usd: float | None, tracked: set[str]) -> str:
-    """Cheap 'why we weren't in it' tag from data in hand (no RPC): a dust prize below our floor
+    """Cheap 'why we weren't in it' tag from data in hand (no RPC): a liquidation in a market we
+    do not cover (other_market — structurally not ours to take), a dust prize below our floor
     (below_floor), else a borrower we were watching (tracked_lost — a real miss) or one we never
-    had in the book (not_tracked)."""
+    had in the book (not_tracked).
+
+    other_market is checked FIRST and by MARKET, because `tracked` holds bare borrower addresses:
+    the same wallet can borrow in a market of ours AND in one we never configured. 19.07 that
+    aliasing labelled a wsrUSD/vbUSDC liquidation (not one of our 6 markets) as tracked_lost —
+    "a real miss" — when we could not have taken it at all, and the prize ($0.28 against a $20
+    floor) was 72x below the floor anyway. A miss tag that fires on unplayable races is worse
+    than no tag: it is the one signal that should mean "we were beaten to money we wanted"."""
+    if (lq.get("market_id") or "").lower() not in _MARKET_BY_ID:
+        return "other_market"
     if bonus_usd is not None and bonus_usd < MIN_PROFIT_USD:
         return "below_floor"
     if (lq.get("borrower") or "").lower() in tracked:
@@ -1733,8 +1743,12 @@ def once(st: dict | None = None, mstate: dict | None = None,
                        f"{lq['liquidator'][:10]}… repaid={lq['repaid_assets']} "
                        f"seized={lq['seized_assets']} blk={lq['block']}")
                 print(f"  {msg}")                 # ALWAYS log — dust races included
-                # alert only when the prize is unknown (fail open) or worth our attention
-                if (bonus is None or bonus >= RACE_ALERT_MIN_USD) and alerts_left > 0:
+                # alert only when the prize is unknown (fail open) or worth our attention.
+                # other_market never pings: it is unpriceable BY CONSTRUCTION (no token config
+                # for a market we don't cover), so fail-open would ping on every dust race in
+                # every foreign Katana market. It stays in the log as venue intel.
+                if (reason != "other_market" and (bonus is None or bonus >= RACE_ALERT_MIN_USD)
+                        and alerts_left > 0):
                     alert(msg)
                     alerts_left -= 1
         st["last_liq_block"] = max(st["last_liq_block"],

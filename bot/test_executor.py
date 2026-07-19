@@ -1540,6 +1540,20 @@ class TestRaceBonus(unittest.TestCase):
         # unpriceable + tracked -> tracked_lost (not below_floor, bonus unknown)
         self.assertEqual(ex._race_reason(lq, None, tracked), "tracked_lost")
 
+    def test_foreign_market_is_not_a_miss_even_for_a_tracked_borrower(self):
+        """19.07 живой случай: заёмщик из нашей книги ликвидирован в wsrUSD/vbUSDC — рынке,
+        которого у нас нет. Совпадение по адресу помечало это как tracked_lost («реальный
+        промах»), хотя взять эту гонку мы не могли в принципе."""
+        lq = _liq("0xd8a93a4cd16f843c385391e208a9a9f2fd75aedfcca05e4810e5fbfcaa6baec6",
+                  repaid_assets=10_611_852, seized_assets=10 * 10 ** 18,
+                  borrower="0x55826f7459236341ee817f0478ee7832cd6f2e7f")
+        tracked = {lq["borrower"]}
+        self.assertEqual(ex._race_reason(lq, None, tracked), "other_market")
+        self.assertEqual(ex._race_reason(lq, 100.0, tracked), "other_market")   # приз не спасает
+        # а в НАШЕМ рынке тот же заёмщик по-прежнему честный промах
+        ours = _liq(self.WBTC_USDC, 10_611_852, borrower=lq["borrower"])
+        self.assertEqual(ex._race_reason(ours, None, tracked), "tracked_lost")
+
 
 class TestRaceTelemetryAlerts(unittest.TestCase):
     """EVERY race logs; only races worth attention (or unpriceable -> fail open) ping TG."""
@@ -1585,11 +1599,26 @@ class TestRaceTelemetryAlerts(unittest.TestCase):
         self.assertEqual(len(self.alerts), 1)
         self.assertIn("🏁 RACE", self.alerts[0])
 
-    def test_unpriceable_race_fails_open_and_alerts(self):
-        _, out = self._run(_liq("0x" + "99" * 32, 1_000_000))      # market not in registry
+    def test_unpriceable_race_in_OUR_market_fails_open_and_alerts(self):
+        """Fail-open остаётся там, где он осмыслен: рынок наш, но цену займа не достали —
+        приз может оказаться крупным, молчать нельзя."""
+        saved = ex._loan_usd_px
+        ex._loan_usd_px = lambda addr: None
+        try:
+            _, out = self._run(_liq(self.WBTC_USDC, 1_000_000))
+        finally:
+            ex._loan_usd_px = saved
         self.assertEqual(len(self._race_log(out)), 1)
         self.assertIn("~$?", self._race_log(out)[0])
         self.assertEqual(len(self.alerts), 1)                      # fail open -> still pings
+
+    def test_foreign_market_race_logs_but_never_pings(self):
+        """Чужой рынок неоценим ПО ПОСТРОЕНИЮ (нет конфига токенов), поэтому fail-open здесь
+        пингует на каждой пылинке в любом чужом рынке Katana. Логируем как venue-интел, но молча."""
+        _, out = self._run(_liq("0x" + "99" * 32, 1_000_000))      # market not in registry
+        self.assertEqual(len(self._race_log(out)), 1)
+        self.assertIn("[other_market]", self._race_log(out)[0])
+        self.assertEqual(self.alerts, [])
 
     def test_tracked_lost_tag_when_borrower_in_book(self):
         b = "0x" + "22" * 20
