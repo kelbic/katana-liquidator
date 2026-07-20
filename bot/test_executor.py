@@ -199,6 +199,149 @@ class TestArmQuoteTimeoutCap(unittest.TestCase):
         self.assertEqual(calls["n"], 0)
 
 
+def _whale_target(seized_btc=196.0, repaid_usdc=16_000_000.0):
+    """The docs/phase2_backtest.md §3.1 borrower: ~$16M of vbUSDC debt against ~196 vbWBTC.
+    Every rung of the static ladder (floor 3/50 = 6% = ~11.8 vbWBTC) is far past pool depth."""
+    t = _target(seized_btc, repaid_usdc)
+    t["price"] = int(repaid_usdc * 1e6 / (seized_btc * 1e8) * 1e36)
+    return t
+
+
+def _depth_bounded_quote(fill_btc, out_per_btc=90000.0, impact=0.008, seen=None):
+    """Quote that reproduces the measured curve: anything above `fill_btc` of collateral comes
+    back Partial (the router cannot fill it), anything at or below it prices normally. `seen`
+    collects every amount_in the executor actually asked for."""
+    def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005, **kw):
+        if seen is not None:
+            seen.append(amount_in_wei)
+        if amount_in_wei > fill_btc * 1e8:
+            raise ex.PartialRouteError(f"Partial: pool depth < {amount_in_wei}")
+        out = int(amount_in_wei / 1e8 * out_per_btc * 1e6)
+        return {"amount_out": out, "price_impact": impact, "gas": 400000,
+                "swap_target": "0x" + "ac" * 20, "swap_calldata": "0xbeef"}
+    return q
+
+
+class TestChunkDescent(unittest.TestCase):
+    """The ladder sizes chunks as a fraction of a FULL CLOSE (floor 3/50), but pool depth is an
+    ABSOLUTE limit. On the §3.1 whale even the floor rung is ~30x the pool, so every rung is
+    Partial and evaluate() used to give up — 59 of the backtest's 95 tickets. evaluate() now
+    descends geometrically below the floor, bounded by f_min = (MIN_PROFIT+gas)/full_prize."""
+
+    def setUp(self):
+        self._orig = ex.quote
+        ex._partial_floor.clear()     # the Partial memo is process-global: isolate each test
+
+    def tearDown(self):
+        ex.quote = self._orig
+        ex._partial_floor.clear()
+
+    def test_whale_reached_by_descent(self):
+        # pool absorbs ~0.35 vbWBTC (the measured f=0.002 rung); the ladder floor is ~11.8
+        ex.quote = _depth_bounded_quote(fill_btc=0.35)
+        ev = ex.evaluate(None, _whale_target(), gas_usd=5.0)
+        self.assertIsNotNone(ev)                       # was None before the descent existed
+        self.assertLess(ev["f"], 3 / 50)               # below every static ladder rung
+        self.assertGreaterEqual(ev["f"], ex.MIN_CHUNK_FRACTION)
+        self.assertGreater(ev["net_usd"], ex.MIN_PROFIT_USD)
+        self.assertLessEqual(ev["seized"] * ex._HAIRCUT_NUM // ex._HAIRCUT_DEN, int(0.35 * 1e8))
+        # halving from the floor lands within 2x of the fillable boundary, no lower
+        self.assertGreater(ev["f"] * 2, 0.35 / 196 / 2)
+
+    def test_descent_does_not_undercut_min_chunk_fraction(self):
+        # pool far shallower than even the hard floor -> no chunk exists, but the descent must
+        # still stop at MIN_CHUNK_FRACTION rather than halving forever
+        seen = []
+        ex.quote = _depth_bounded_quote(fill_btc=1e-6, seen=seen)
+        self.assertIsNone(ex.evaluate(None, _whale_target(), gas_usd=5.0))
+        smallest = min(seen)
+        self.assertGreaterEqual(smallest / (196.0 * 1e8), ex.MIN_CHUNK_FRACTION / 2)
+
+    def test_ordinary_position_costs_the_same_quotes(self):
+        # fast path must not degrade: a position whose ladder fills makes exactly as many
+        # round-trips as it did before the descent was added (1 at full close).
+        calls = {"n": 0}
+        base = _stub_quote(out_per_btc=61500, impact=0.008)
+
+        def q(*a, **k):
+            calls["n"] += 1
+            return base(*a, **k)
+        ex.quote = q
+        ev = ex.evaluate(None, _target(1.0, 61000.0), gas_usd=0.01)
+        self.assertEqual(ev["f"], 1.0)
+        self.assertEqual(calls["n"], 1)               # descent never generated
+
+    def test_ordinary_chunked_position_costs_the_same_quotes(self):
+        # impact-driven chunk-down stops at 1/2 (impact 0.03*f): 3 quotes, exactly as before
+        calls = {"n": 0}
+
+        def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005, **kw):
+            calls["n"] += 1
+            frac = amount_in_wei / (1.0 * 1e8)
+            return {"amount_out": int(amount_in_wei / 1e8 * 63000 * 1e6),
+                    "price_impact": 0.03 * frac, "gas": 400000,
+                    "swap_target": "0x" + "ac" * 20, "swap_calldata": "0xbeef"}
+        ex.quote = q
+        ev = ex.evaluate(None, _target(1.0, 61000.0), gas_usd=0.01)
+        self.assertEqual(ev["f"], 0.5)
+        self.assertEqual(calls["n"], 3)
+
+    def test_f_min_stops_descent_when_the_prize_is_tiny(self):
+        # full prize ~$25 against a $5 gas bill and a $20 floor -> f_min ~ 1.0: NO fraction can
+        # clear the gate, so the descent must not fire a single extra round-trip.
+        calls = {"n": 0}
+        base = _depth_bounded_quote(fill_btc=1e-9)
+
+        def q(*a, **k):
+            calls["n"] += 1
+            return base(*a, **k)
+        ex.quote = q
+        t = _target(0.01, 571.0)                       # (LIF-1)*571 ~ $25 of bonus
+        t["price"] = int(571.0 * 1e6 / (0.01 * 1e8) * 1e36)
+        self.assertIsNone(ex.evaluate(None, t, gas_usd=5.0))
+        self.assertLessEqual(calls["n"], len(ex.CHUNK_FRACTIONS))   # ladder only, no descent
+
+    def test_f_min_band_is_the_economic_one(self):
+        # direct check of the generator: prize $700k, $20 floor, $5 gas -> f_min ~ 3.6e-5, below
+        # the hard floor, so the band bottoms out at MIN_CHUNK_FRACTION
+        fr = list(ex._chunk_fractions(700_000.0, 5.0))
+        self.assertEqual(fr[:len(ex.CHUNK_FRACTIONS)], list(ex.CHUNK_FRACTIONS))
+        tail = [n / d for n, d in fr[len(ex.CHUNK_FRACTIONS):]]
+        self.assertTrue(tail and all(f >= ex.MIN_CHUNK_FRACTION for f in tail))
+        self.assertAlmostEqual(tail[0], (3 / 50) / 2)                  # halving, not 1.5x
+        for a, b in zip(tail, tail[1:]):
+            self.assertAlmostEqual(b, a / 2)
+        # a $2 000 prize cannot pay a $20 floor + $5 gas below f=0.0125 -> band ends there
+        tail2 = [n / d for n, d in ex._chunk_fractions(2000.0, 5.0)][len(ex.CHUNK_FRACTIONS):]
+        self.assertTrue(all(f >= 25.0 / 2000.0 for f in tail2))
+        # unpriceable loan: no economic bound -> no descent at all
+        self.assertEqual(list(ex._chunk_fractions(None, 5.0)), list(ex.CHUNK_FRACTIONS))
+
+    def test_descent_never_starts_a_quote_past_the_deadline(self):
+        calls = {"n": 0}
+
+        def q(*a, **k):
+            calls["n"] += 1
+            raise AssertionError("no round-trip may start on a spent deadline")
+        ex.quote = q
+        ev = ex.evaluate(None, _whale_target(), gas_usd=5.0,
+                         deadline_mono=time.monotonic() - 1.0)
+        self.assertIsNone(ev)
+        self.assertEqual(calls["n"], 0)
+
+    def test_partial_memo_gives_free_skips_on_the_next_pass(self):
+        seen1, seen2 = [], []
+        ex.quote = _depth_bounded_quote(fill_btc=0.35, seen=seen1)
+        self.assertIsNotNone(ex.evaluate(None, _whale_target(), gas_usd=5.0))
+        floor_amt = ex._partial_floor[(VBWBTC.lower(), VBUSDC.lower())][0]
+        ex.quote = _depth_bounded_quote(fill_btc=0.35, seen=seen2)
+        self.assertIsNotNone(ex.evaluate(None, _whale_target(), gas_usd=5.0))
+        # Partial is monotone in size: every rung at or above the cached floor is skipped with
+        # NO network at all, so the second pass resumes near the boundary.
+        self.assertTrue(all(a < floor_amt for a in seen2))
+        self.assertLess(len(seen2), len(seen1))
+
+
 class TestCalldata(unittest.TestCase):
     def test_selector_and_wellformed(self):
         t = _target()

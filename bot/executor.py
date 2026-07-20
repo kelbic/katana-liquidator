@@ -24,7 +24,8 @@ current near-edge borrowers, instantly, NO getLogs scan from block 0 (that is im
 Config (env, KT_ prefix): KT_CONTRACT (req for live), KT_PRIVATE_KEY or KT_KEYFILE
   (~/.katana-bot/key), KT_RPC (write, def rpc.katana.network), KT_READ_RPC (read override, e.g.
   a local anvil fork), KT_MIN_PROFIT_USD (20), KT_MIN_DEBT_USD (500), KT_MAX_SLIPPAGE (0.008),
-  KT_MAX_IMPACT (0.02), KT_POLL_SEC (20), KT_MAX_DAILY_GAS_USD (5), KT_MAX_CONSEC_REVERTS (3),
+  KT_MAX_IMPACT (0.02), KT_MIN_CHUNK_FRACTION (0.0002 — hard floor of the chunk descent),
+  KT_POLL_SEC (20), KT_MAX_DAILY_GAS_USD (5), KT_MAX_CONSEC_REVERTS (3),
   KT_DEDUP_SEC (300), KT_GAS_LIMIT (1_800_000), KT_CHAIN_ID (747474), KT_PRIORITY_GWEI (0.001),
   KT_DISCOVERY (api [default] | logs), KT_API_HF_CEILING (1.15 — discovery watch ceiling),
   KT_CHECKPOINT_BLOCK (only for KT_DISCOVERY=logs; the api path needs no checkpoint),
@@ -356,6 +357,71 @@ CHUNK_FRACTIONS = ((1, 1), (3, 4), (1, 2), (7, 20), (1, 4), (3, 20), (1, 10), (3
 _HAIRCUT_NUM = 1000 - int(round(SWAP_INPUT_HAIRCUT * 1000))
 _HAIRCUT_DEN = 1000
 
+# --- below the ladder: an economically bounded geometric descent -----------------------------
+# CHUNK_FRACTIONS are fractions of a FULL CLOSE and bottom out at 3/50 = 6%. But what actually
+# limits a chunk is POOL DEPTH — an ABSOLUTE size — not a share of the position, and on a whale
+# the two diverge wildly. The $16M borrower in docs/phase2_backtest.md §3.1 held ~196 vbWBTC, so
+# even the 6% floor rung is ~10.6 vbWBTC: still ~30x more than the vbWBTC/vbUSDC pool could
+# absorb. Every rung came back Partial and evaluate() gave up. That single failure mode is 59 of
+# the backtest's 95 tickets and 47% of all prize dollars; the measured quote curve at blk
+# 16693558 shows why (f=1 implies BTC at $657, the 6% floor $10 916, f=0.002 the true $85 548).
+# Competitors simply take small ABSOLUTE slices — tx 0x1ca415902d86 carries four Liquidate logs
+# on one borrower in one tx.
+#
+# The fix is NOT 20 more rungs in the tuple. Every rung is a ~0.3s Sushi round-trip, and
+# evaluate() also runs on the arm path under deadline_mono where the entire budget is one or two
+# quotes. A longer static ladder would charge that latency to EVERY target to serve the rare
+# whale, wrecking the race the rest of the bot exists to win.
+#
+# Instead, descend geometrically below the ladder floor, but only inside the band where a chunk
+# can still pay. Net is ~linear in the fraction f (the bonus is f*(LIF-1)*repaid_full; gas does
+# not scale), so net(f) ~ f * full_prize_usd - gas_usd, and NO fraction below
+#       f_min = (MIN_PROFIT_USD + gas_usd) / full_prize_usd
+# can ever clear the profit gate. Quoting under f_min is guaranteed-wasted network. f_min costs
+# zero round-trips (full_prize_usd comes from numbers evaluate() already holds) and is
+# deliberately OPTIMISTIC — it ignores swap impact and the haircut, which only shrink net — so it
+# can only prune provably-hopeless sizes, never a chunk that would have paid.
+#
+# Ratio 2 (halving), not 1.5: the band spans at most 3/50 -> MIN_CHUNK_FRACTION, ~300x, which is
+# ~8 halvings but ~14 steps at 1.5x — 2.4s vs 4.2s of deadline at ~0.3s a quote. Halving lands
+# within 2x of the true fillable boundary and we take the FIRST rung that both fills and clears
+# the gate. The gate is an absolute $20, not a fraction of optimal, so a 2x-coarse landing still
+# books the ticket; precision below the boundary is worth far less here than latency.
+#
+# Why not bisect. Partial IS monotone in size (_partial_known below rests on exactly that), so
+# bisection is available in principle — it is rejected because it does not pay. Bisection needs a
+# BRACKET first, and finding the bracket is precisely this geometric descent; exponential-search-
+# then-binary-search therefore costs the descent PLUS the refinement — strictly MORE round-trips
+# than the descent alone — to buy a tighter fit than the 2x halving already gives. The
+# monotonicity is used the cheap way instead: _partial_known turns every size at or above a known
+# Partial into a FREE skip, so a later pass over the same whale resumes near the boundary rather
+# than re-walking the ladder from f=1.
+MIN_CHUNK_FRACTION = float(os.environ.get("KT_MIN_CHUNK_FRACTION", "0.0002"))
+
+
+def _chunk_fractions(full_prize_usd: float | None, gas_usd: float):
+    """Chunk fractions to try, largest-first: the static ladder, then a halving descent bounded
+    below by f_min (economics) and MIN_CHUNK_FRACTION (hard floor).
+
+    LAZY on purpose: evaluate() breaks out of the loop on the first profitable chunk, so for an
+    ordinary position — where a ladder rung fills — the descent is never generated and the quote
+    count is bit-for-bit what it was before. The descent only ever runs once the ladder has been
+    walked to its floor without a fillable, profitable chunk.
+
+    Yields RATIONALS, never floats: repaidShares on an 18-dec loan run ~1e27, past float64's
+    exact-int range, and sizing must stay exact integer math (review C1)."""
+    for num, den in CHUNK_FRACTIONS:
+        yield num, den
+    if not full_prize_usd or full_prize_usd <= 0:
+        return          # unpriceable loan: no economic bound to descend inside, so don't descend
+    f_lo = max((MIN_PROFIT_USD + gas_usd) / full_prize_usd, MIN_CHUNK_FRACTION)
+    num, den = CHUNK_FRACTIONS[-1]
+    while True:
+        den *= 2        # 3/50 -> 3/100 -> 3/200 ... exact rationals, halving each step
+        if num / den < f_lo:
+            return      # terminates: f_lo >= MIN_CHUNK_FRACTION > 0
+        yield num, den
+
 
 # --- state (kill-switch / dedup) ----------------------------------------------
 # _fire_lock guards EVERY mutation of the shared fire-accounting state — st["fires"],
@@ -657,12 +723,17 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = No
     loan_px = _loan_usd_px(loan)
     # USD profit floor converted into loan wei (stables: $1/token as before; vbETH via ETH_USD)
     usd_floor_wei = max(1, int(MIN_PROFIT_USD / loan_px * 10 ** loan_dec)) if loan_px else 1
+    # Full prize of a complete close, in USD, with NO network call: in a Morpho close
+    # seized_value == repaid_value * LIF, so the bonus is (LIF-1) * repaid_full (the same
+    # conversion _race_bonus_usd uses). This is what bounds how far below the ladder floor a
+    # chunk can still pay for itself — see the _chunk_fractions block above.
+    full_prize_usd = ((lif - 1.0) * repaid_full / 10 ** loan_dec * loan_px) if loan_px else None
 
     best = None
     deadline = time.monotonic() + EVAL_DEADLINE_SEC
     if deadline_mono is not None:
         deadline = min(deadline, deadline_mono)
-    for num, den in CHUNK_FRACTIONS:
+    for num, den in _chunk_fractions(full_prize_usd, gas_usd):
         if time.monotonic() > deadline:
             # checked BEFORE each quote: a spent budget must never start another network
             # round-trip (the post-failure checks below only cover the failure paths)

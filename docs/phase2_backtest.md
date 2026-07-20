@@ -295,3 +295,47 @@ Rebuilding the quoter runtime (`analysis/phase2_quoter.hex`) requires the Solidi
   few rows describe slices of a single race rather than independent opportunities.
 * **No mempool/latency modelling.** Inclusion order, propagation and the competitor's best
   response are all out of scope — see the honesty boundary in §5.
+
+---
+
+## 8. Postscript — the sizing defect is fixed (re-measured)
+
+Everything above measures the bot **as it stood at HEAD 254a652**. The §3.1 defect has since been
+fixed in `bot/executor.py`: below the `3/50` ladder floor `evaluate()` now descends by halving,
+bounded from below by `f_min = (MIN_PROFIT_USD + gas_usd) / full_prize_usd` — the fraction under
+which no chunk can clear the profit gate, since `net(f) ≈ f × full_prize − gas` — and by a hard
+`MIN_CHUNK_FRACTION = 0.0002`. The descent is generated lazily, so a position whose ladder fills
+costs exactly the round-trips it always did.
+
+Re-running this same script with that sizer (`analysis/phase2_backtest.py`, unchanged
+methodology, same 95 tickets):
+
+| | before | after |
+|---|---:|---:|
+| route assembles | 36 / 95 | **63 / 95** |
+| … whale `0x14bcd9da05…` | 5 / 64 | **32 / 64** |
+| … all other borrowers | 31 / 31 | 31 / 31 |
+| prod net total | $93 853 | **$112 875** |
+| clearing the Phase-2 $300 gate | 35 | 44 |
+
+The 36 tickets that already assembled are **unchanged, row for row** — same chunk fractions
+(`f=1.0`×26, `0.75`×2, `0.35`×1, `0.15`×1, `0.06`×6), same $93 853 — which is the regression
+proof that the fast path did not move. The 27 newly-reachable tickets are won at
+`f ∈ {0.0075, 0.00375, 0.001875, 0.000937, 0.000469}`, all below the old floor, for $19 022 net
+(median $94; 9 of them clear $300). Max impact across all 63 is 1.92%, still inside the 2% cap.
+
+Two honest deltas from the §3.1 diagnostic, which projected 63 rows / $22 399 / median $158:
+
+* the **row count matches exactly (63)**, and **no ticket the ideal fine-grained ladder could
+  reach is still missed** — the economic bound `f_min` prunes only provably-hopeless sizes;
+* the **dollars are ~15% lower** ($19 022 vs $22 399) and so is the median. This is expected and
+  was chosen: the diagnostic took the *best* rung on a 17-point ladder, while the production
+  descent halves and takes the *first* rung that fills and pays, landing within 2× of the
+  boundary rather than on it. Each extra rung is a ~0.3s Sushi round-trip, and `evaluate()` also
+  runs on the arm path under `deadline_mono`; buying that last ~$3 400 across 406 days with
+  finer steps would cost latency in every race. Worst case the descent adds 8 rungs (16 total);
+  the `_partial_known` memo makes all rungs above a known-Partial size free on later passes.
+
+**This does not change §5 or §6.** Reachability is not a win-rate — these 27 tickets now merely
+reach the auction. The funding argument is unchanged except that the segment the bid can act on
+is now materially larger.

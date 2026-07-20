@@ -61,6 +61,7 @@ GAS_UNITS_EST = 900_000
 HOT_WATCH_HF = 1.05
 REPORT_HF = 1.15
 CHUNK_FRACTIONS = ((1, 1), (3, 4), (1, 2), (7, 20), (1, 4), (3, 20), (1, 10), (3, 50))
+MIN_CHUNK_FRACTION = 0.0002
 SWAP_INPUT_HAIRCUT = 0.003
 _HAIRCUT_NUM = 1000 - int(round(SWAP_INPUT_HAIRCUT * 1000))
 _HAIRCUT_DEN = 1000
@@ -317,6 +318,25 @@ DEEP_FRACTIONS = (0.06, 0.04, 0.025, 0.016, 0.010, 0.0063, 0.0040, 0.0025,
                   0.0016, 0.0010, 0.00063, 0.00040, 0.00025, 0.00016, 0.0001, 0.00005, 0.00002)
 
 
+def _chunk_fractions(full_prize_usd, gas_usd):
+    """Mirror of bot/executor.py _chunk_fractions: the static ladder, then a halving descent
+    bounded below by f_min = (MIN_PROFIT_USD + gas_usd) / full_prize_usd (no fraction under it
+    can clear the profit gate, since net(f) ~ f*full_prize - gas) and by MIN_CHUNK_FRACTION.
+    Mirrored rather than imported for the same reason the gates above are: the backtest must
+    reproduce byte-for-byte regardless of the operator's KT_* environment."""
+    for num, den in CHUNK_FRACTIONS:
+        yield num, den
+    if not full_prize_usd or full_prize_usd <= 0:
+        return
+    f_lo = max((MIN_PROFIT_USD + gas_usd) / full_prize_usd, MIN_CHUNK_FRACTION)
+    num, den = CHUNK_FRACTIONS[-1]
+    while True:
+        den *= 2
+        if num / den < f_lo:
+            return
+        yield num, den
+
+
 def _net_for(amount_in, proceeds, capped, seized_arg_scale, repaid_full, seized_full,
              price, lif, loan_dec, gas_usd):
     """USD net of exiting `amount_in` collateral for `proceeds` loan assets."""
@@ -350,7 +370,10 @@ def evaluate_hist(rpc: Rpc, row: dict, gas_usd: float, block: int) -> dict | Non
         seized = int(seized_full * frac)
         return max(0, seized * _HAIRCUT_NUM // _HAIRCUT_DEN)
 
-    prod_fracs = [n / d for n, d in CHUNK_FRACTIONS]
+    # production sizing = ladder + economically bounded descent (bot/executor.py). The prize is
+    # (LIF-1)*repaid_full converted to USD, exactly as evaluate() computes full_prize_usd.
+    full_prize_usd = (lif - 1.0) * repaid_full / 10 ** loan_dec * loan_px
+    prod_fracs = [n / d for n, d in _chunk_fractions(full_prize_usd, gas_usd)]
     all_fracs = prod_fracs + [f for f in DEEP_FRACTIONS if f not in prod_fracs]
     amounts = [amount_for(f) for f in all_fracs]
     # Mid-price reference (~0.001% of a full close): evaluate() gets priceImpact from Sushi;
