@@ -129,6 +129,13 @@ MIN_DEBT_USD = float(os.environ.get("KT_MIN_DEBT_USD", "500"))
 # cascade of above-floor races can't firehose TG.
 RACE_ALERT_MIN_USD = float(os.environ.get("KT_RACE_ALERT_MIN_USD", str(MIN_PROFIT_USD)))
 RACE_ALERT_MAX = int(os.environ.get("KT_RACE_ALERT_MAX", "5"))
+# Phase-2 trigger probe (KT_RACE_PROBE=1, default ON): enrich each observed race with the two
+# facts the funding decision turns on and that the log did NOT carry — the WINNER'S TIP and
+# whether the ticket was CONTESTED. Both need RPC, so they run in a DETACHED thread and are
+# logged as a separate `RACE+` line; the hot loop never waits on them (the 19.07 lesson: the
+# autopsy's round-trips used to land right before the sweep of a cascade pass).
+RACE_PROBE = os.environ.get("KT_RACE_PROBE", "1") == "1"
+RACE_PROBE_MAX_RECEIPTS = int(os.environ.get("KT_RACE_PROBE_MAX_RECEIPTS", "12"))
 MAX_SLIPPAGE = float(os.environ.get("KT_MAX_SLIPPAGE", "0.008"))   # swap floor sent to Sushi
 MAX_IMPACT = float(os.environ.get("KT_MAX_IMPACT", "0.02"))        # chunk if impact above this
 POLL_SEC = int(os.environ.get("KT_POLL_SEC", "20"))         # cadence when NOTHING is near-edge
@@ -627,6 +634,55 @@ def _race_bonus_usd(lq: dict) -> float | None:
     repaid_usd = lq.get("repaid_assets", 0) / 10 ** tok["decimals"] * loan_px
     lif = lif_from_lltv(int(round(mkt["lltv"] * 10 ** 18)))
     return (lif - 1.0) * repaid_usd
+
+
+def _race_probe(tx: str, blk: int, borrower: str, prize: str, reason: str,
+                rpc: "Rpc | None" = None) -> None:
+    """DETACHED: enrich one observed race with winner tip + contested count, then log `RACE+`.
+
+    Answers the two Phase-2 triggers the plain RACE line could not (STATE.md 20.07): is an
+    AUCTION forming (winner tip rising above our 0.001 gwei default), and is anyone actually
+    FIGHTING for tickets (failed attempts alongside the winner). Both were measured by hand on
+    20.07; this makes them standing telemetry instead of an archaeology session.
+
+    Runs off the hot path in its own thread with its OWN Rpc — the main one keeps alive
+    connections that are not thread-safe — and touches no shared state.
+
+    `contested` counts REVERTED contract calls in the winner's block. Competitors fire through
+    their OWN liquidator contracts (measured: only 15 direct Morpho calls across 18 liquidation
+    blocks), so filtering by `to == MORPHO` would miss them entirely; a loser's tx reverts and
+    that is the observable. It is a PROXY — an unrelated failed swap counts too — so it is
+    reported as a count next to the tip, never as a verdict on its own."""
+    try:
+        rpc = rpc or Rpc()
+        t = rpc.call("eth_getTransactionByHash", [tx]) or {}
+        tip_wei = int(t.get("maxPriorityFeePerGas") or t.get("gasPrice") or "0x0", 16)
+        block = rpc.get_block(blk, True) or {}
+        txs = block.get("transactions") or []
+        # only contract calls can be liquidation attempts; cap the receipts so a busy block
+        # cannot turn one race into a hundred round-trips
+        cands = [x for x in txs
+                 if x.get("hash") != tx and (x.get("input") or "0x") != "0x" and x.get("to")]
+        failed = 0
+        for x in cands[:RACE_PROBE_MAX_RECEIPTS]:
+            try:
+                rc = rpc.receipt(x["hash"])
+            except Exception:
+                continue
+            if rc and rc.get("status") == "0x0":
+                failed += 1
+        capped = "+" if len(cands) > RACE_PROBE_MAX_RECEIPTS else ""
+        line = (f"RACE+ {prize} [{reason}] {borrower[:10]}… tip={tip_wei / 1e9:.6f}gwei "
+                f"contested={failed}{capped}/{min(len(cands), RACE_PROBE_MAX_RECEIPTS)} "
+                f"blk={blk} tx={tx[:14]}…")
+        print(f"  🔬 {line}")
+        # ping only on a REGIME CHANGE: a tip above our default means an auction we cannot win
+        # by default any more — that is the Phase-2 trigger, not routine dust.
+        if tip_wei > int(PRIORITY_GWEI * 1e9):
+            alert(f"🔬 {line} — ставка победителя ВЫШЕ нашего дефолта "
+                  f"{PRIORITY_GWEI} gwei (триггер Фазы 2)")
+    except Exception as e:                         # telemetry must never disturb the bot
+        print(f"  race probe failed ({tx[:14]}…): {str(e)[:100]}")
 
 
 def _race_reason(lq: dict, bonus_usd: float | None, tracked: set[str]) -> str:
@@ -1863,6 +1919,12 @@ def once(st: dict | None = None, mstate: dict | None = None,
                         and alerts_left > 0):
                     alert(msg)
                     alerts_left -= 1
+                # winner tip + contested count — DETACHED, captures only ready values so the
+                # thread never reads st or the main (non-thread-safe) Rpc
+                if RACE_PROBE and lq.get("tx"):
+                    threading.Thread(target=_race_probe,
+                                     args=(lq["tx"], lq["block"], lq["borrower"], prize, reason),
+                                     daemon=True).start()
         st["last_liq_block"] = max(st["last_liq_block"],
                                    max(lq["block"] for lq in r["liquidations"]))
 

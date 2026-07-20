@@ -1699,6 +1699,71 @@ class TestRaceBonus(unittest.TestCase):
         self.assertEqual(ex._race_reason(ours, None, tracked), "tracked_lost")
 
 
+class TestRaceProbe(unittest.TestCase):
+    """Фаза-2 зонд: ставка победителя + счётчик борьбы. Оба поля меряются СЕТЬЮ, поэтому
+    зонд обязан быть отсоединён от горячего цикла и не трогать общее состояние."""
+
+    def setUp(self):
+        self._alert, self._prio = ex.alert, ex.PRIORITY_GWEI
+        self.alerts = []
+        ex.alert = lambda text, sync=False: self.alerts.append(text)
+        ex.PRIORITY_GWEI = 0.001
+
+    def tearDown(self):
+        ex.alert, ex.PRIORITY_GWEI = self._alert, self._prio
+
+    class _Rpc:
+        """Мок только того среза, который зонд реально трогает."""
+        def __init__(self, tip_wei, statuses):
+            self.tip, self.statuses, self.receipts_read = tip_wei, statuses, 0
+        def call(self, method, params):
+            if method == "eth_getTransactionByHash":
+                return {"maxPriorityFeePerGas": hex(self.tip)}
+            raise AssertionError(f"неожиданный вызов {method}")
+        def get_block(self, blk, full=False):
+            return {"transactions": [{"hash": f"0x{i:02x}", "input": "0xdead", "to": "0xc"}
+                                     for i in range(len(self.statuses))]}
+        def receipt(self, txh):
+            self.receipts_read += 1
+            return {"status": self.statuses[int(txh, 16)]}
+
+    def test_reports_tip_and_contested_count(self):
+        rpc = self._Rpc(5 * 10 ** 9, ["0x1", "0x0", "0x0"])   # победитель + 2 провала
+        out = _capture(ex._race_probe, "0xaa", 100, "0x" + "bb" * 20, "~$500", "tracked_lost",
+                       rpc=rpc)
+        self.assertIn("tip=5.000000gwei", out)
+        self.assertIn("contested=2/3", out)
+
+    def test_tip_above_our_default_pings_as_phase2_trigger(self):
+        """Ставка выше нашего дефолта = аукцион, который мы по умолчанию уже не выигрываем."""
+        rpc = self._Rpc(int(0.5 * 10 ** 9), ["0x1"])
+        _capture(ex._race_probe, "0xaa", 100, "0x" + "bb" * 20, "~$500", "tracked_lost", rpc=rpc)
+        self.assertEqual(len(self.alerts), 1, self.alerts)
+        self.assertIn("триггер Фазы 2", self.alerts[0])
+
+    def test_dust_tip_stays_quiet(self):
+        """Пылевая ставка (как у всех 19 наблюдённых 20.07) — рутина, в TG не идёт."""
+        rpc = self._Rpc(10 ** 5, ["0x1"])                      # 0.0001 gwei
+        _capture(ex._race_probe, "0xaa", 100, "0x" + "bb" * 20, "~$1", "other_market", rpc=rpc)
+        self.assertEqual(self.alerts, [])
+
+    def test_receipts_are_capped(self):
+        """Занятый блок не должен превращать одну гонку в сотню round-trip'ов."""
+        n = ex.RACE_PROBE_MAX_RECEIPTS + 40
+        rpc = self._Rpc(10 ** 6, ["0x1"] * n)
+        out = _capture(ex._race_probe, "0xaa", 100, "0x" + "bb" * 20, "~$1", "not_tracked",
+                       rpc=rpc)
+        self.assertEqual(rpc.receipts_read, ex.RACE_PROBE_MAX_RECEIPTS)
+        self.assertIn("+", out)                                # пометка усечения
+
+    def test_probe_failure_never_disturbs_the_bot(self):
+        class Boom:
+            def call(self, *a, **k): raise RuntimeError("нода легла")
+        out = _capture(ex._race_probe, "0xaa", 100, "0x" + "bb" * 20, "~$1", "x", rpc=Boom())
+        self.assertIn("race probe failed", out)
+        self.assertEqual(self.alerts, [])
+
+
 class TestRaceTelemetryAlerts(unittest.TestCase):
     """EVERY race logs; only races worth attention (or unpriceable -> fail open) ping TG."""
     WBTC_USDC = MARKETS["vbWBTC/vbUSDC"]["id"]
