@@ -68,6 +68,15 @@ MARKETS = {
         "id": "0x1e74d36ffbda65b8a45d72754b349cdd5ce807c5fa814f91ba8e3cd27881c34b",
         "lltv": 0.915, "loan": "vbETH", "coll": "weETH",
         "oracle": "0xD0457014ae86DF159482Ad6ddaD9bB6827DF4bc9"},
+    "weETH/vbUSDT": {   # ~$645k borrow — the ONLY near-edge position whose HF moves on ETH price
+        # (weETH collateral vs USD debt); needs ~-10% ETH from HF 1.11. Added as a stress OPTION
+        # 21.07: near-free (no fire-path latency cost — route is fetched only when a position is a
+        # target, same as every market). Route verified live: Sushi weETH→vbUSDT impact 0.23% @$5k,
+        # < LIF 4.4% up to ~$250k/chunk (chunk-descent slices the whale). Oracle feeds verified
+        # on-chain: BASE_FEED_1=weETH_FUNDAMENTAL, BASE_FEED_2=ETH/USD.
+        "id": "0xbb4fb94ca819744df6a8f3932fffad47d31e8d76d3c48216878295c4cf588caf",
+        "lltv": 0.86, "loan": "vbUSDT", "coll": "weETH",
+        "oracle": "0xE8926ab782fe3799F062D2C3C23E3532d6408364"},
 }
 
 # --- Morpho event signatures (canonical) --------------------------------------------------

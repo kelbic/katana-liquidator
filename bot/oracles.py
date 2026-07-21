@@ -98,6 +98,9 @@ _MARKET_FEEDS_BY_PAIR: dict[str, list[str]] = {
     "vbETH/vbUSDT": ["ETH/USD"],
     "LBTC/vbUSDC": ["LBTC/USD", "USDC/USD"],
     "weETH/vbETH": ["weETH_FUNDAMENTAL"],
+    "weETH/vbUSDT": ["ETH/USD", "weETH_FUNDAMENTAL"],   # weETH coll / USD debt; feeds verified
+    # on-chain from oracle 0xE8926ab: BASE_FEED_1=weETH_FUNDAMENTAL, BASE_FEED_2→ETH/USD (volatile
+    # base first per the convention above). The vbUSDT quote leg is a stablecoin peg — untracked.
 }
 
 # marketId (0x…, lower) -> [feed names]. Resolved against the protocols registry so the ids stay

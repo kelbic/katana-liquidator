@@ -26,13 +26,14 @@ ETH_USDC = oc._lc(MARKETS["vbETH/vbUSDC"]["id"])
 ETH_USDT = oc._lc(MARKETS["vbETH/vbUSDT"]["id"])
 LBTC_USDC = oc._lc(MARKETS["LBTC/vbUSDC"]["id"])
 WEETH_ETH = oc._lc(MARKETS["weETH/vbETH"]["id"])
+WEETH_USDT = oc._lc(MARKETS["weETH/vbUSDT"]["id"])   # option add 21.07: weETH coll / USD debt
 
 
 class TestReverseIndexes(unittest.TestCase):
     def test_every_market_has_feeds(self):
-        # all six live markets are covered
-        self.assertEqual(len(oc.MARKET_FEEDS), 6)
-        for mid in (WBTC_USDC, WBTC_USDT, ETH_USDC, ETH_USDT, LBTC_USDC, WEETH_ETH):
+        # all seven live markets are covered (weETH/vbUSDT added 21.07 as a stress option)
+        self.assertEqual(len(oc.MARKET_FEEDS), 7)
+        for mid in (WBTC_USDC, WBTC_USDT, ETH_USDC, ETH_USDT, LBTC_USDC, WEETH_ETH, WEETH_USDT):
             self.assertIn(mid, oc.MARKET_FEEDS)
 
     def test_aggregators_map_to_feeds(self):
@@ -54,14 +55,17 @@ class TestMarketResolution(unittest.TestCase):
     def test_aggregator_to_match_is_unambiguous(self):
         # BTC/USD aggregator -> exactly the two WBTC markets
         self.assertEqual(oc.markets_for_tx(to=BTC_AGG, frm=None), {WBTC_USDC, WBTC_USDT})
-        self.assertEqual(oc.markets_for_tx(to=ETH_AGG, frm=None), {ETH_USDC, ETH_USDT})
+        # ETH/USD now reprices weETH/vbUSDT too (weETH coll priced via ETH/USD leg)
+        self.assertEqual(oc.markets_for_tx(to=ETH_AGG, frm=None), {ETH_USDC, ETH_USDT, WEETH_USDT})
         self.assertEqual(oc.markets_for_tx(to=LBTC_AGG, frm=None), {LBTC_USDC})
-        self.assertEqual(oc.markets_for_tx(to=REDSTONE, frm=None), {WEETH_ETH})
+        # weETH_FUNDAMENTAL drives both weETH markets (vbETH and vbUSDT legs)
+        self.assertEqual(oc.markets_for_tx(to=REDSTONE, frm=None), {WEETH_ETH, WEETH_USDT})
 
     def test_shared_transmitter_from_is_broad(self):
-        # 0x9185 signs BTC+ETH -> union of all four BTC/ETH markets (graceful degradation)
+        # 0x9185 signs BTC+ETH -> union of all BTC/ETH markets (graceful degradation); the ETH leg
+        # now also covers weETH/vbUSDT (priced via ETH/USD)
         self.assertEqual(oc.markets_for_tx(to=None, frm=SHARED_EOA),
-                         {WBTC_USDC, WBTC_USDT, ETH_USDC, ETH_USDT})
+                         {WBTC_USDC, WBTC_USDT, ETH_USDC, ETH_USDT, WEETH_USDT})
 
     def test_dedicated_transmitter_from_is_narrow(self):
         self.assertEqual(oc.markets_for_tx(to=None, frm=BTC_ONLY_EOA), {WBTC_USDC, WBTC_USDT})
