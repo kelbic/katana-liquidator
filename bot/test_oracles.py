@@ -27,13 +27,19 @@ ETH_USDT = oc._lc(MARKETS["vbETH/vbUSDT"]["id"])
 LBTC_USDC = oc._lc(MARKETS["LBTC/vbUSDC"]["id"])
 WEETH_ETH = oc._lc(MARKETS["weETH/vbETH"]["id"])
 WEETH_USDT = oc._lc(MARKETS["weETH/vbUSDT"]["id"])   # option add 21.07: weETH coll / USD debt
+STCUSD_USDC = oc._lc(MARKETS["stcUSD/vbUSDC"]["id"])  # option add 22.07: depeg-опцион capUSD
+AVKAT_KAT = oc._lc(MARKETS["avKAT/KAT"]["id"])        # option add 22.07: vault-only оракул
+USDC_AGG = "0xa89e9c15935bfb49d0f11d0d2ecf6bb7800cbe97"
+CAPUSD_AGG = "0x0df59ef5bb4832cba10fee136ef7a501380261d7"
+AVKAT_VAULT = "0x7231dbacdfc968e07656d12389ab20de82fbfceb"
 
 
 class TestReverseIndexes(unittest.TestCase):
     def test_every_market_has_feeds(self):
-        # all seven live markets are covered (weETH/vbUSDT added 21.07 as a stress option)
-        self.assertEqual(len(oc.MARKET_FEEDS), 7)
-        for mid in (WBTC_USDC, WBTC_USDT, ETH_USDC, ETH_USDT, LBTC_USDC, WEETH_ETH, WEETH_USDT):
+        # all nine live markets are covered (weETH/vbUSDT 21.07; stcUSD и avKAT/KAT 22.07)
+        self.assertEqual(len(oc.MARKET_FEEDS), 9)
+        for mid in (WBTC_USDC, WBTC_USDT, ETH_USDC, ETH_USDT, LBTC_USDC, WEETH_ETH, WEETH_USDT,
+                    STCUSD_USDC, AVKAT_KAT):
             self.assertIn(mid, oc.MARKET_FEEDS)
 
     def test_aggregators_map_to_feeds(self):
@@ -60,6 +66,15 @@ class TestMarketResolution(unittest.TestCase):
         self.assertEqual(oc.markets_for_tx(to=LBTC_AGG, frm=None), {LBTC_USDC})
         # weETH_FUNDAMENTAL drives both weETH markets (vbETH and vbUSDT legs)
         self.assertEqual(oc.markets_for_tx(to=REDSTONE, frm=None), {WEETH_ETH, WEETH_USDT})
+
+    def test_new_markets_2207_wiring(self):
+        # capUSD/USD (депег-нога) -> ровно стейбл-рынок stcUSD
+        self.assertEqual(oc.markets_for_tx(to=CAPUSD_AGG, frm=None), {STCUSD_USDC})
+        # USDC/USD теперь также репрайсит stcUSD/vbUSDC (4-й USDC-рынок)
+        self.assertIn(STCUSD_USDC, oc.markets_for_tx(to=USDC_AGG, frm=None))
+        # vault-only оракул: tx к самому вольту avKAT армит рынок avKAT/KAT
+        self.assertEqual(oc.markets_for_tx(to=AVKAT_VAULT, frm=None), {AVKAT_KAT})
+        self.assertTrue(oc.is_oracle_tx(AVKAT_VAULT, None))
 
     def test_shared_transmitter_from_is_broad(self):
         # 0x9185 signs BTC+ETH -> union of all BTC/ETH markets (graceful degradation); the ETH leg

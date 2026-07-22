@@ -31,6 +31,9 @@ TOKENS = {
     "vbETH":  {"address": "0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62", "decimals": 18},
     "weETH":  {"address": "0x9893989433e7a383Cb313953e4c2365107dc19a7", "decimals": 18},
     "LBTC":   {"address": "0xecAc9C5F704e954931349Da37F60E39f515c11c1", "decimals": 8},
+    "stcUSD": {"address": "0x88887bE419578051FF9F4eb6C858A951921D8888", "decimals": 18},
+    "KAT":    {"address": "0x7F1f4b4b29f5058fA32CC7a97141b8D7e5ABDC2d", "decimals": 18},
+    "avKAT":  {"address": "0x7231dbaCdFc968E07656D12389AB20De82FbfCeB", "decimals": 18},
 }
 ADDR_TO_SYMBOL = {v["address"].lower(): k for k, v in TOKENS.items()}
 
@@ -77,6 +80,19 @@ MARKETS = {
         "id": "0xbb4fb94ca819744df6a8f3932fffad47d31e8d76d3c48216878295c4cf588caf",
         "lltv": 0.86, "loan": "vbUSDT", "coll": "weETH",
         "oracle": "0xE8926ab782fe3799F062D2C3C23E3532d6408364"},
+    "stcUSD/vbUSDC": {  # $808k borrow, near-edge $808k @ HF 1.02 (22.07) — depeg-опцион capUSD.
+        # Oracle 0x832AEC: BASE_1=stcUSD/capUSD rate, BASE_2=capUSD/USD, QUOTE_1=USDC/USD (наш).
+        # Sushi stcUSD→vbUSDC: impact 0.12% @$5k / 0.21% @$50k << LIF 4.4%.
+        "id": "0xea8f588be62079a1ad874bf7c7217166b323e0fe8ea3e59b584430ed1b859ace",
+        "lltv": 0.86, "loan": "vbUSDC", "coll": "stcUSD",
+        "oracle": "0x832AEC697F9031709281e29ACb4fB69b1E3A6f7a"},
+    "avKAT/KAT": {      # $276k borrow, near-edge $137k @ HF 1.0013 (22.07!) — у самого края.
+        # Vault-only oracle (BASE_VAULT=avKAT ERC4626, фидов нет): цена = convertToAssets, HF
+        # ползёт с exchange rate — как weETH/vbETH, но вообще без внешних фидов. LIF при lltv
+        # 0.77 = 7.4%; Sushi avKAT→KAT impact 0.64% @$1k / 1.0% @$10k — запас велик.
+        "id": "0x80e60fe453223b0f84a567724f88190bef708420d24397157067d424429783e9",
+        "lltv": 0.77, "loan": "KAT", "coll": "avKAT",
+        "oracle": "0xC5d4f6f7B1F5deC7Ec191d3612388F95F5f7f47c"},
 }
 
 # --- Morpho event signatures (canonical) --------------------------------------------------

@@ -87,6 +87,28 @@ FEEDS: dict[str, dict] = {
         "aggregator": "0xe8d9fbc10e00ecc9f0694617075fdaf657a76fb2",
         "transmitters": set(),
     },
+    # stcUSD legs (22.07): медленные push-фиды (~4 обновления/день, без OCR-комитета); апдейты
+    # приходят через СМЕННЫЕ батч-контракты (to варьируется), так что to-матч по агрегатору
+    # практически не срабатывает — это осознанная деградация: рынок стейбловый, стреляет от
+    # депега capUSD, а его ловит обычный скан; same-block слой тут не критичен.
+    "stcUSD_RATE": {    # 'STCAPUSD / CAPUSD Exchange Rate' (18 dec)
+        "kind": "chainlink",
+        "aggregator": "0x24e332c78921753fcf3c7516b761cbd09dcc9f48",
+        "transmitters": set(),
+    },
+    "capUSD/USD": {     # 'CAPUSD / USD Exchange Rate' (8 dec) — депег-нога
+        "kind": "chainlink",
+        "aggregator": "0x0df59ef5bb4832cba10fee136ef7a501380261d7",
+        "transmitters": set(),
+    },
+    # avKAT/KAT (22.07): vault-only оракул — внешних фидов НЕТ (BASE_VAULT=avKAT ERC4626,
+    # цена = convertToAssets). exchange rate меняют tx В САМ ВОЛЬТ (deposit/withdraw/harvest),
+    # поэтому «агрегатор» здесь = адрес вольта: любой pending tx к нему армит рынок.
+    "avKAT_VAULT": {
+        "kind": "vault",
+        "aggregator": "0x7231dbacdfc968e07656d12389ab20de82fbfceb",
+        "transmitters": set(),
+    },
 }
 
 # --- which feeds drive each market's Morpho oracle price (by pair name -> feed list) ---------
@@ -101,6 +123,9 @@ _MARKET_FEEDS_BY_PAIR: dict[str, list[str]] = {
     "weETH/vbUSDT": ["ETH/USD", "weETH_FUNDAMENTAL"],   # weETH coll / USD debt; feeds verified
     # on-chain from oracle 0xE8926ab: BASE_FEED_1=weETH_FUNDAMENTAL, BASE_FEED_2→ETH/USD (volatile
     # base first per the convention above). The vbUSDT quote leg is a stablecoin peg — untracked.
+    "stcUSD/vbUSDC": ["capUSD/USD", "stcUSD_RATE", "USDC/USD"],  # депег-нога первой (volatile
+    # first): ликвидации тут случаются от ухода capUSD с пега, rate/USDC — медленные ноги.
+    "avKAT/KAT": ["avKAT_VAULT"],   # vault-only оракул: единственный «фид» — сам вольт avKAT
 }
 
 # marketId (0x…, lower) -> [feed names]. Resolved against the protocols registry so the ids stay
