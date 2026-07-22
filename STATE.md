@@ -3,6 +3,28 @@
 Battle-ready liquidation bot for Morpho Blue on **Katana** (chainId 747474). This file is the
 verdict + architecture + economics + decision log. Operator handoff steps are in `README.md`.
 
+## 2026-07-22 — РЫНКИ 8-9: stcUSD/vbUSDC + avKAT/KAT (discovery-скан, commit d5e8b99)
+
+Полный discovery по Morpho GraphQL (все ~30 живых рынков Katana + near-edge HF≤1.15):
+- **stcUSD/vbUSDC** ($808k borrow, near-edge $808k @ minHF 1.019) — депег-опцион capUSD.
+  Оракул: stcUSD/capUSD rate + capUSD/USD + наш USDC/USD. Новые фиды — медленные push
+  (~4/день, to-матч по агрегатору деградирует: апдейты через сменные батч-контракты; рынок
+  ловится обычным сканом, same-block слой некритичен). Sushi 0.12%@$5k / 0.21%@$50k.
+- **avKAT/KAT** ($276k, near-edge $137k @ **minHF 1.0013** — у самого края) — vault-only
+  оракул (BASE_VAULT=avKAT ERC4626, внешних фидов НЕТ): цена = convertToAssets, «фид» в
+  реестре = сам вольт (kind "vault"), армимся на tx к нему. LIF при lltv 0.77 = **7.4%**;
+  Sushi 0.64%@$1k / 1.0%@$10k. Ликвидность жидкая — чанк-descent решает.
+- **yv-петли НЕ добавлены** (yvvbUSDC/vbUSDT + yvvbUSDT/vbUSDC, $982k near-edge @ 1.033):
+  Sushi **NoWay** на Yearn-шары — атомарный выход требует vault.redeem() в контракте.
+  Кандидат на контракт v2, отдельное решение.
+- **yUSD/vbUSDC — bad debt, мимо**: 20 позиций HF 0.01–0.07, долг $5.6k против $157
+  коллатерала СУММАРНО (депег yUSD) — забирать нечего, потому никто и не брал. После
+  рестарта бот сам оценил их и скипнул («no profitable chunk») — поведение корректное.
+
+290 тестов зелёные. Рестарт ок: positions 25→562 (API-рефреш по 9 рынкам), hot-poll
+снова capped-25, predict-слой поднялся. Латентность не тронута (тот же профиль, что
+weETH/vbUSDT: роут тянется только для HF<1 целей).
+
 Status as of **2026-07-13**: verification done, code built, **fork-tested end-to-end**, deploy-
 ready. Stopped BEFORE live mainnet deploy (operator's key + funding = operator's step).
 
