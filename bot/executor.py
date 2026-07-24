@@ -122,6 +122,10 @@ READ_RPCS = [os.environ["KT_READ_RPC"]] if os.environ.get("KT_READ_RPC") else No
 
 MIN_PROFIT_USD = float(os.environ.get("KT_MIN_PROFIT_USD", "20"))
 MIN_DEBT_USD = float(os.environ.get("KT_MIN_DEBT_USD", "500"))
+# Жёсткий потолок на СКАН одного прохода. 24.07 все четыре бота флота (4 разных чейна)
+# синхронно замерли на ~406с — отказ egress ХОСТА, не чейна: per-вызов таймауты были,
+# границы у прохода не было. Ставится на скан и снимается перед fire-путём (тот же rpc).
+PASS_WALL_SEC = float(os.environ.get("KT_PASS_WALL_SEC", "90"))
 # Competitor-race telemetry: EVERY race a competitor won is LOGGED (with its on-the-table prize
 # + a why-we-weren't-in-it tag), but only races worth our attention PING Telegram — the quiet
 # mode. Default alert floor = the profit floor (a race whose bonus is below it we'd never
@@ -1883,7 +1887,14 @@ def once(st: dict | None = None, mstate: dict | None = None,
     if mstate is None:
         mstate = _seed_monitor_state()
 
-    r = scan(rpc, mstate, min_debt_usd=MIN_DEBT_USD, skip_api=skip_api)
+    # Потолок ПРОХОДА на скан (24.07: хост потерял egress — проход висел 406с молча;
+    # per-вызов таймауты есть, границы у прохода не было). Снимается сразу после скана:
+    # fire-путь ниже использует ТОТ ЖЕ rpc и ограничиваться по времени не должен.
+    rpc.deadline = time.monotonic() + PASS_WALL_SEC
+    try:
+        r = scan(rpc, mstate, min_debt_usd=MIN_DEBT_USD, skip_api=skip_api)
+    finally:
+        rpc.deadline = None
     mstate.clear()
     mstate.update(r["state"])
     st["passes"] += 1

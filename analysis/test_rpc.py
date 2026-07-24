@@ -161,5 +161,49 @@ class TestFirePathHelpers(PoolTestCase):
         self.assertEqual(self._rpc(retries=2).block_number(), 0x3)
 
 
+class TestTransientAndPassDeadline(PoolTestCase):
+    """24.07: (1) `-32603 Internal server error` летел `raise RpcError` сразу — одна икота
+    эндпоинта убивала весь проход; (2) все 4 бота флота синхронно замерли на ~406с (отказ
+    egress ХОСТА) — per-вызов таймауты были, границы у ПРОХОДА не было."""
+
+    def _err(self, code, message) -> bytes:
+        return json.dumps({"jsonrpc": "2.0", "id": 1,
+                           "error": {"code": code, "message": message}}).encode()
+
+    def test_internal_error_rotates_instead_of_killing_pass(self):
+        self.scripts = [[self._err(-32603, "Internal server error")], [_result("0x9")]]
+        r = Rpc(urls=["https://a.test", "https://b.test"], retries=3, min_interval=0.0)
+        self.assertEqual(r.block_number(), 0x9)          # ротация, а не смерть прохода
+
+    def test_header_not_found_rotates(self):
+        self.scripts = [[self._err(-32000, "header not found")], [_result("0xa")]]
+        r = Rpc(urls=["https://a.test", "https://b.test"], retries=3, min_interval=0.0)
+        self.assertEqual(r.block_number(), 0xa)
+
+    def test_generic_32000_still_raises(self):
+        # -32000 НЕ код-уровневый транзиент: клиенты вешают на него настоящие вердикты
+        self.scripts = [[self._err(-32000, "boom")]]
+        with self.assertRaises(RpcError):
+            self._rpc(retries=3).block_number()
+
+    def test_range_error_still_raises_for_chunker(self):
+        # get_logs_chunked делит окно по этому исключению — маркер range имеет приоритет
+        self.scripts = [[self._err(-32603, "block range is too large")]]
+        with self.assertRaises(RpcError):
+            self._rpc(retries=3).call("eth_getLogs", [{}])
+
+    def test_past_pass_deadline_fails_fast(self):
+        import time as _t
+        self.scripts = [[_result("0x1")]]
+        r = self._rpc(retries=3)
+        r.deadline = _t.monotonic() - 1.0
+        with self.assertRaises(rpc_mod.PassDeadlineExceeded):
+            r.block_number()
+        self.assertEqual(self.made, [])                  # ни одного сетевого коннекта
+
+    def test_no_deadline_by_default(self):
+        self.assertIsNone(self._rpc().deadline)
+
+
 if __name__ == "__main__":
     unittest.main()

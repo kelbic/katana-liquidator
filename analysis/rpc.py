@@ -44,6 +44,34 @@ class RpcError(RuntimeError):
         self.message = message
 
 
+class PassDeadlineExceeded(RuntimeError):
+    """Бюджет ПРОХОДА исчерпан (Rpc.deadline). Отдельный класс, чтобы вызывающий мог
+    отличить «хост/сеть легли, проход брошен» от вердикта ноды. Ловится общим
+    `except Exception` в главном цикле — проход бросается, следующий тик идёт штатно."""
+
+
+# Серверные икоты, которые НИЧЕГО не говорят о запросе: эндпоинт транзиентно сломан —
+# ротируемся, а не убиваем проход. 24.07: `-32603 Internal server error` летел
+# `raise RpcError` СРАЗУ (ветка `except RpcError: raise`), обрывая проход целиком.
+# -32000 «header not found» — гонка за головой блока, тот же класс. RANGE-маркеры имеют
+# ПРИОРИТЕТ: get_logs_chunked обязан увидеть «range too large» исключением, чтобы делить окно.
+# ВАЖНО: -32000 НЕ код-уровневый транзиент — клиенты вешают на него и настоящие вердикты
+# (execution error, insufficient funds). Он транзиентен ТОЛЬКО по сообщению («header not
+# found» = гонка за головой). Код-уровень оставляем за -32603 (JSON-RPC «Internal error»).
+_TRANSIENT_CODES = (-32603, -32016)
+_TRANSIENT_MARKS = ("timeout", "try again", "temporarily", "overloaded", "busy",
+                    "internal error", "server error", "rate limit", "capacity",
+                    "header not found")
+_RANGE_MARKS = ("range", "result", "block")
+
+
+def _is_transient(code, message) -> bool:
+    m = (message or "").lower()
+    if any(s in m for s in _RANGE_MARKS):
+        return False
+    return code in _TRANSIENT_CODES or any(s in m for s in _TRANSIENT_MARKS)
+
+
 class HttpStatusError(OSError):
     """Non-200 HTTP status from the endpoint (429 rate limit, 5xx LB errors). Transport-class:
     retried/rotated by Rpc.call exactly like the old urllib HTTPError path."""
@@ -113,6 +141,10 @@ class Rpc:
         self.backoff_429 = backoff_429    # race paths pass a small value: rotate, don't wait
         self._id = 0
         self._last_call = 0.0
+        # optional per-ПРОХОД wall-дедлайн (monotonic). 24.07 хост потерял egress, и проход
+        # висел 406с молча — per-вызов таймауты есть, границы у ПРОХОДА не было. Executor
+        # ставит дедлайн на скан и СНИМАЕТ его перед fire-путём (тот же rpc). None = без границы.
+        self.deadline: float | None = None
 
     def _body(self, method: str, params: list) -> bytes:
         self._id += 1
@@ -125,16 +157,28 @@ class Rpc:
         body = self._body(method, params)
         last = None
         for attempt in range(self.retries):
+            if self.deadline is not None and time.monotonic() >= self.deadline:
+                raise PassDeadlineExceeded(f"pass deadline exceeded ({method}): {last}")
             wait = self.min_interval - (time.time() - self._last_call)
             if wait > 0:
                 time.sleep(wait)
             self._last_call = time.time()
             url = self.urls[attempt % len(self.urls)]
+            per = self.timeout
+            if self.deadline is not None:          # сокет не ждёт дольше остатка бюджета
+                per = max(0.1, min(per, self.deadline - time.monotonic()))
             try:
-                d = json.loads(_pooled_post(url, body, self.timeout))
+                d = json.loads(_pooled_post(url, body, per))
                 if "error" in d:
                     err = d["error"]
-                    raise RpcError(err.get("code"), err.get("message", ""))
+                    code, msg = err.get("code"), err.get("message", "")
+                    if _is_transient(code, msg):
+                        # серверная икота — скамейка не нужна (ротация по attempt), просто
+                        # следующая попытка на другом эндпоинте вместо смерти прохода
+                        last = RpcError(code, msg)
+                        time.sleep(0.2 * (attempt + 1))
+                        continue
+                    raise RpcError(code, msg)
                 return d["result"]
             except RpcError:
                 raise
