@@ -95,7 +95,7 @@ from datetime import datetime, timezone
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from analysis.keccak import selector                                   # noqa: E402
+from analysis.keccak import event_topic0, selector                     # noqa: E402
 from analysis.models import lif_from_lltv                              # noqa: E402
 from analysis.monitor import scan, load_state as load_monitor_state    # noqa: E402
 from analysis.multicall import MULTICALL3                              # noqa: E402
@@ -544,21 +544,44 @@ def _tg_muted() -> bool:
 
 
 def _alert_send(text: str, timeout: float = 5.0) -> None:
+    """Отправить алерт в Telegram И записать его в лог — НА ВСЕХ ПУТЯХ, включая успешный.
+
+    29.07: первый боевой выстрел за всю жизнь бота (блок 38600666) не оставил в executor.log
+    НИ ОДНОЙ строки — `print` стоял только на путях mute/disabled/ошибки, а на успешном пути
+    алерт уходил в TG и исчезал. `grep -c 🔫` по всем четырём логам давал 0, хеша транзакции
+    в логах не было. Следствие: P&L катаны из логов невосстановим в принципе (у wc — можно,
+    там `✅ WIN … +$N net` пишется в лог), а единственный локальный след — `exec_state.json`,
+    который перетирается.
+
+    Урок того же класса, что и мёртвый сторож: прибор, молчащий на успехе, лжёт умолчанием
+    о единственном событии, ради которого он существует. Лог — форензический артефакт, а
+    Telegram — уведомление; путать их роли нельзя, TG не хранит историю и не грепается."""
     text = _tagged(text)
+
+    def _log(line: str) -> None:
+        # ОДНА запись на строку: alert() по умолчанию бежит в демон-потоке, а под
+        # PYTHONUNBUFFERED=1 каждый write — отдельный сисколл, так что `print(a); print(b)`
+        # из двух потоков переплёлся бы прямо в форензическом логе, ради которого всё и
+        # затевалось. Склеиваем перевод строки заранее и пишем одним вызовом.
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+
+    # Лог ПЕРВЫМ и безусловно — до мьюта, до токена, до сетевого round-trip. Если процесс
+    # умрёт на отправке в TG (или TG будет лежать), запись о событии всё равно уже на диске.
     if _tg_muted():
-        print(f"[tg muted] {text}")
-        return
+        return _log(f"{text}   [tg заглушён: тестовый прогон]")
     token = _tg_token()
     if not token or not CHAT_ID:
-        print(f"[alert disabled] {text}")
-        return
+        return _log(f"{text}   [tg отключён: нет токена или chat_id]")
+    _log(text)
     try:
         data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text}).encode()
         urllib.request.urlopen(
             urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage",
                                    data=data), timeout=timeout)
     except Exception as e:
-        print(f"alert fail: {e}")
+        # недоставленная тревога — тот же отказ уровнем ниже; молчать о нём нельзя
+        _log(f"   ↑ [tg НЕ ДОСТАВЛЕНО: {e}] {text}")
 
 
 def alert(text: str, sync: bool = False) -> None:
@@ -1056,6 +1079,53 @@ def _preflight_call(calldata: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+# --- деньги выстрела прямо из расписки ----------------------------------------
+# KatanaLiquidator.sol:70
+#   event Liquidated(address indexed borrower, address indexed loanToken,
+#                    uint256 profit, uint256 seizedAssets, uint256 repaidAssets)
+_LIQUIDATED_TOPIC = event_topic0("Liquidated(address,address,uint256,uint256,uint256)")
+
+
+def _receipt_pnl(rcpt: dict) -> str:
+    """Хвост для алерта исхода: излишек (собственное событие контракта), фактический газ, чисто.
+
+    ЗАЧЕМ: алерт исхода был `✅ ok: 0x…` — по нему невозможно понять, заработали мы или сожгли
+    газ. У первого боевого выстрела 29.07 излишек был $0.0869 при газе $0.0455 (чисто +$0.0414),
+    и чтобы это узнать, пришлось вручную поднимать расписку и декодировать трансферы. Прибор
+    обязан называть сумму сам — иначе «✅» неотличимо от убыточной победы.
+
+    Берём именно `profit` из события, а не разницу трансферов: контракт считает излишек после
+    погашения и свопа, это ровно та величина, которую он выметает владельцу.
+
+    НИКОГДА НЕ БРОСАЕТ: это отчётность внутри пути огня — её отказ не имеет права уронить
+    расчёт или потерять сам факт исхода."""
+    try:
+        gas = (int(rcpt["gasUsed"], 16) * int(rcpt.get("effectiveGasPrice", "0x0"), 16)
+               / 1e18 * ETH_USD)
+    except Exception:
+        return ""
+    try:
+        me = (CONTRACT or "").lower()
+        ev = None
+        for lg in rcpt.get("logs") or []:
+            tops = lg.get("topics") or []
+            if (lg.get("address", "").lower() == me and tops
+                    and tops[0].lower() == _LIQUIDATED_TOPIC and len(tops) >= 3):
+                ev = lg
+                break
+        if ev is None:   # revert / lost race — приза нет, но газ сожжён и это надо назвать
+            return f" (газ ${gas:.4f})"
+        loan = "0x" + ev["topics"][2][-40:]
+        profit = int(ev["data"][2:][0:64], 16)
+        dec, px = _DEC.get(loan.lower()), _loan_usd_px(loan)
+        if dec is None or px is None:   # непрайсуемый займ: units честнее выдуманных долларов
+            return f" (излишек {profit} units {loan[:10]}…, газ ${gas:.4f})"
+        gross = profit / 10 ** dec * px
+        return f" +${gross - gas:.4f} чисто (излишек ${gross:.4f} − газ ${gas:.4f})"
+    except Exception as e:
+        return f" (P&L не посчитан: {e}; газ ${gas:.4f})"
+
+
 def _settle(st: dict, key: str, txh: str, rcpt: dict, now_ts: float,
             gas_est_usd: float, calldata: str | None) -> str:
     """Classify a mined receipt: ok / lost_race / revert; swap the pre-charged gas estimate
@@ -1164,7 +1234,7 @@ def _post_broadcast(t: dict, ev: dict, st: dict, now_ts: float, key: str, callda
         return
     outcome = _settle(st, key, txh, rcpt, now_ts, gas_usd, calldata)
     icon = "✅" if outcome == "ok" else ("🏁" if outcome.startswith("lost_race") else "❌")
-    alert(f"{icon} {outcome}: {txh}")
+    alert(f"{icon} {outcome}{_receipt_pnl(rcpt)}: {txh}")
 
 
 def _fire_cast(t: dict, ev: dict, st: dict, now_ts: float, key: str, calldata: str,
@@ -1217,7 +1287,7 @@ def _check_pending(st: dict, now_ts: float) -> None:
         if rcpt:
             outcome = _settle(st, key, rec["tx"], rcpt, rec["ts"],
                               rec.get("gas_est", 0.0), rec.get("calldata"))
-            alert(f"📬 pending settled — {outcome}: {rec['tx']}")
+            alert(f"📬 pending settled — {outcome}{_receipt_pnl(rcpt)}: {rec['tx']}")
         elif now_ts - rec["ts"] > 600:
             with _fire_lock:
                 rec["status"] = "stale"

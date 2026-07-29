@@ -2424,3 +2424,118 @@ class TestTelegramMuteGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAlertsAlwaysReachTheLog(unittest.TestCase):
+    """29.07: первый боевой выстрел за всю жизнь бота не оставил в executor.log ни строки.
+
+    `_alert_send` печатал только на путях mute/disabled/ошибки; на успешном пути алерт уходил
+    в Telegram и исчезал. `grep -c 🔫` по всем четырём логам = 0, хеша транзакции нет. P&L
+    katana из логов восстановить было НЕЛЬЗЯ — при том, что для wc это штатная операция.
+    Тест держит инвариант: лог — форензический артефакт, Telegram — только уведомление."""
+
+    def setUp(self):
+        self._save = (ex.CHAT_ID, ex._TG_TOKEN)
+        ex.CHAT_ID, ex._TG_TOKEN = "-100123", "tok"
+
+    def tearDown(self):
+        ex.CHAT_ID, ex._TG_TOKEN = self._save
+
+    @contextlib.contextmanager
+    def _run(self, deliver=True):
+        """Прогон с ФЕЙКОВЫМ транспортом и снятым мьютом: тест про ТЕКСТ в логе.
+        Живой Telegram недостижим по построению — urlopen подменён."""
+        buf = io.StringIO()
+
+        def fake_urlopen(req, timeout=None):
+            if not deliver:
+                raise OSError("connection refused")
+            return io.BytesIO(b'{"ok":true}')
+
+        with mock.patch.dict(os.environ, {"KT_MUTE_TG": "0"}), \
+             mock.patch.object(urllib.request, "urlopen", fake_urlopen), \
+             contextlib.redirect_stdout(buf):
+            yield buf
+
+    def test_delivered_alert_is_still_printed(self):
+        """ИМЕННО ЭТА регрессия: доставка в TG прошла — значит в лог не попало ничего."""
+        with self._run() as buf:
+            ex.alert("🔫 sent 0xdeadbeef HF=0.9975 chunk=100%", sync=True)
+        out = buf.getvalue()
+        self.assertIn("🔫 sent 0xdeadbeef", out)
+        self.assertIn(f"[{ex.BOT_TAG}]", out)
+
+    def test_undelivered_alert_says_so_in_the_log(self):
+        """Недоставленная тревога — тот же отказ уровнем ниже; молчать о нём нельзя."""
+        with self._run(deliver=False) as buf:
+            ex.alert("🔫 sent 0xdeadbeef", sync=True)
+        out = buf.getvalue()
+        self.assertIn("🔫 sent 0xdeadbeef", out)
+        self.assertIn("НЕ ДОСТАВЛЕНО", out)
+
+    def test_muted_alert_still_printed(self):
+        """Под мьютом (тестовый прогон) текст обязан остаться в логе — иначе тесты слепы."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ex.alert("❌ revert something", sync=True)
+        self.assertIn("❌ revert something", buf.getvalue())
+
+
+# Расписка ПЕРВОГО БОЕВОГО ВЫСТРЕЛА katana, 29.07.2026, блок 38600666:
+# tx 0x232000d2dcd9a7138e151237945144784d203ed5b829bef2162926e63b985a34
+# Золотые данные с чейна: profit=0x15378=86904, seized=0xceb=3307, repaid=0x1ee336=2024246.
+_FIRST_FIRE_LOAN = "0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a"          # AUSD, 6 dec
+_FIRST_FIRE_RCPT = {
+    "status": "0x1", "gasUsed": "0x7373d", "effectiveGasPrice": "0x30a32c0",
+    "logs": [
+        {"address": "0xecac9c5f704e954931349da37f60e39f515c11c1",       # посторонний Transfer
+         "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
+                    "0x" + "00" * 32, "0x" + "00" * 32], "data": "0x" + "00" * 32},
+        {"address": "0x000000000000000000000000000000000000bEEF",        # KT_CONTRACT в тестах
+         "topics": ["0xfcbc974bf3a532baf2bb229db3c37fd58299b62d2d1db6a855dac5b693bb6ff3",
+                    "0x000000000000000000000000feed46c11f57b7126a773eec6ae9ca7ae1c03c9a",
+                    "0x00000000000000000000000000000000efe302beaa2b3e6e1b18d08d69a9012a"],
+         "data": ("0x" + "0" * 59 + "15378" + "0" * 61 + "ceb" + "0" * 58 + "1ee336")},
+    ],
+}
+
+
+class TestReceiptPnl(unittest.TestCase):
+    """Алерт исхода был `✅ ok: 0x…` — по нему нельзя отличить заработок от сожжённого газа.
+    Теперь деньги берутся из собственного события контракта Liquidated. Проверяем на РЕАЛЬНОЙ
+    расписке первого выстрела, а не на выдуманных числах."""
+
+    def setUp(self):
+        self._eth = ex.ETH_USD
+        ex.ETH_USD = 1884.7          # цена, при которой бот записал газ $0.045455
+
+    def tearDown(self):
+        ex.ETH_USD = self._eth
+        ex._DEC.pop(_FIRST_FIRE_LOAN.lower(), None)
+
+    def test_golden_receipt_priceable_loan(self):
+        """Заём прайсуется -> алерт называет излишек, газ и ЧИСТО."""
+        ex._DEC[_FIRST_FIRE_LOAN.lower()] = 6
+        with mock.patch.object(ex, "STABLES", set(ex.STABLES) | {_FIRST_FIRE_LOAN.lower()}):
+            note = ex._receipt_pnl(_FIRST_FIRE_RCPT)
+        self.assertIn("излишек $0.0869", note)      # 86904 / 1e6 * $1
+        self.assertIn("газ $0.0455", note)          # 472893 * 0.051 gwei * $1884.7
+        self.assertIn("+$0.0414", note)             # чистыми — то, ради чего всё
+        self.assertNotIn("не посчитан", note)
+
+    def test_unpriceable_loan_reports_units_not_fake_dollars(self):
+        """Незнакомый заём (AUSD ВНЕ реестра, как на самом деле) — units честнее выдуманных $."""
+        note = ex._receipt_pnl(_FIRST_FIRE_RCPT)
+        self.assertIn("86904 units", note)
+        self.assertIn("газ $0.0455", note)
+
+    def test_revert_receipt_still_names_the_burned_gas(self):
+        """Реверт/проигрыш: события Liquidated нет, но газ сожжён — сумму назвать обязаны."""
+        rcpt = dict(_FIRST_FIRE_RCPT, status="0x0", logs=[])
+        self.assertIn("газ $0.0455", ex._receipt_pnl(rcpt))
+
+    def test_never_raises_on_garbage(self):
+        """Отчётность внутри пути огня не имеет права уронить расчёт исхода."""
+        for bad in ({}, {"gasUsed": "нечисло"}, {"gasUsed": "0x1", "logs": "не список"},
+                    {"gasUsed": "0x1", "effectiveGasPrice": "0x1", "logs": [{"topics": []}]}):
+            self.assertIsInstance(ex._receipt_pnl(bad), str)
