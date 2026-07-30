@@ -2761,9 +2761,11 @@ class TestHotsetLog(unittest.TestCase):
 class TestRateWatch(unittest.TestCase):
     """Замер 30.07: ни один рынок Katana не таймер — коллатерал дорожает быстрее займа.
     Но у weETH/vbETH, где 87% денег чейна, перевес всего +1.1%/год. Смена знака превращает
-    лотерею в расписание, и увидеть её можно только сравнив ставку с дрейфом."""
+    лотерею в расписание, и увидеть её можно только сравнив ставку с дрейфом.
+    Сигнал идёт В ЛОГ, не в TG (правило 30.07 «боты-опционы»): вернут alert() — сьют упадёт.
+    Окно 7д: первое 6-часовое окно 30.07 дало залп из 5 ложных «таймеров» одним махом."""
 
-    WINDOW = 21600.0
+    WINDOW = 604800.0
 
     def _row(self, mid, prize_lltv=770000000000000000, debt=100_000):
         r = _hot_row(1.01, debt, lltv=prize_lltv)
@@ -2771,15 +2773,19 @@ class TestRateWatch(unittest.TestCase):
         return r
 
     def _run(self, st, px, rate, now, mid="0x" + "80" * 32):
-        sent = []
+        tg = []
         save = ex.alert
+        buf = io.StringIO()
         try:
-            ex.alert = lambda m, **k: sent.append(m)
-            ex._rate_watch({"targets": [], "risk": [self._row(mid)],
-                            "rates": {mid: rate}, "prices": {mid: px}}, st, now)
+            ex.alert = lambda m, **k: tg.append(m)
+            with contextlib.redirect_stdout(buf):
+                ex._rate_watch({"targets": [], "risk": [self._row(mid)],
+                                "rates": {mid: rate}, "prices": {mid: px}}, st, now)
         finally:
             ex.alert = save
-        return sent
+        # регресс-ловушка: смена режима — предвестник, бот отрабатывает её сам; в TG — никогда
+        self.assertEqual(tg, [])
+        return [ln.strip() for ln in buf.getvalue().splitlines() if "⏱" in ln]
 
     @staticmethod
     def _rate(apr_pct):
