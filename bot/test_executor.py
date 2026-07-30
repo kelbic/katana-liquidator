@@ -2752,3 +2752,92 @@ class TestHotsetLog(unittest.TestCase):
 
     def test_no_hot_pairs_is_silent(self):
         self.assertEqual(self._capture({"block": 1, "targets": [], "risk": [], "state": {}}), "")
+
+
+class TestRateWatch(unittest.TestCase):
+    """Замер 30.07: ни один рынок Katana не таймер — коллатерал дорожает быстрее займа.
+    Но у weETH/vbETH, где 87% денег чейна, перевес всего +1.1%/год. Смена знака превращает
+    лотерею в расписание, и увидеть её можно только сравнив ставку с дрейфом."""
+
+    WINDOW = 21600.0
+
+    def _row(self, mid, prize_lltv=770000000000000000, debt=100_000):
+        r = _hot_row(1.01, debt, lltv=prize_lltv)
+        r["market_id"] = mid
+        return r
+
+    def _run(self, st, px, rate, now, mid="0x" + "80" * 32):
+        sent = []
+        save = ex.alert
+        try:
+            ex.alert = lambda m, **k: sent.append(m)
+            ex._rate_watch({"targets": [], "risk": [self._row(mid)],
+                            "rates": {mid: rate}, "prices": {mid: px}}, st, now)
+        finally:
+            ex.alert = save
+        return sent
+
+    @staticmethod
+    def _rate(apr_pct):
+        return int(apr_pct / 100.0 * 1e18 / 31_536_000)
+
+    def test_first_pass_only_takes_a_baseline(self):
+        st = {}
+        self.assertEqual(self._run(st, 10 ** 36, self._rate(2.0), 1000.0), [])
+        self.assertTrue(st["oracle_baseline"])
+
+    def test_no_alert_before_the_window_fills(self):
+        st = {}
+        self._run(st, 10 ** 36, self._rate(2.0), 1000.0)
+        self.assertEqual(self._run(st, 10 ** 36, self._rate(99.0), 1000.0 + 60), [])
+
+    def test_alerts_once_when_rate_overtakes_drift(self):
+        """Дрейф +1%/год против ставки 5%/год — режим сменился."""
+        st = {}
+        self._run(st, 10 ** 36, self._rate(5.0), 0.0)
+        px = int(10 ** 36 * (1 + 0.01 * self.WINDOW / 31_536_000))     # ~+1%/год
+        sent = self._run(st, px, self._rate(5.0), self.WINDOW)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("ОБОГНАЛА", sent[0])
+        # второй такой же проход молчит: алерт на СМЕНУ знака, не на состояние
+        px2 = int(px * (1 + 0.01 * self.WINDOW / 31_536_000))
+        self.assertEqual(self._run(st, px2, self._rate(5.0), 2 * self.WINDOW), [])
+
+    def test_alerts_on_the_way_back(self):
+        st = {}
+        self._run(st, 10 ** 36, self._rate(5.0), 0.0)
+        px = int(10 ** 36 * (1 + 0.01 * self.WINDOW / 31_536_000))
+        self._run(st, px, self._rate(5.0), self.WINDOW)                # ушло вниз
+        px2 = int(px * (1 + 0.20 * self.WINDOW / 31_536_000))          # дрейф +20%/год
+        sent = self._run(st, px2, self._rate(5.0), 2 * self.WINDOW)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("самозалечиваются", sent[0])
+
+    def test_silent_while_drift_leads(self):
+        st = {}
+        self._run(st, 10 ** 36, self._rate(1.2), 0.0)
+        px = int(10 ** 36 * (1 + 0.024 * self.WINDOW / 31_536_000))    # +2.4%/год как weETH
+        self.assertEqual(self._run(st, px, self._rate(1.2), self.WINDOW), [])
+
+    def test_below_prize_threshold_is_not_watched(self):
+        mid = "0x" + "81" * 32
+        st = {}
+        sent = []
+        save = ex.alert
+        try:
+            ex.alert = lambda m, **k: sent.append(m)
+            row = _hot_row(1.01, None, loan=UNPRICEABLE)   # приз 0 -> вне наблюдения
+            row["market_id"] = mid
+            ex._rate_watch({"targets": [], "risk": [row], "rates": {mid: 1},
+                            "prices": {mid: 10 ** 36}}, st, 0.0)
+        finally:
+            ex.alert = save
+        self.assertEqual(sent, [])
+        self.assertEqual(st.get("oracle_baseline", {}), {})
+
+    def test_missing_data_never_raises(self):
+        for r in ({"targets": [], "risk": [], "rates": {}, "prices": {}},
+                  {"targets": [], "risk": [self._row("0xzz")], "rates": {}, "prices": {}},
+                  {"targets": [], "risk": [self._row("0xzz")], "rates": {"0xzz": 0},
+                   "prices": {"0xzz": 0}}):
+            ex._rate_watch(r, {}, 0.0)

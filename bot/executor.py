@@ -859,6 +859,63 @@ BORROW_WATCH_USD = float(os.environ.get("KT_BORROW_WATCH_USD", "50"))
 BORROW_WATCH_MAX_BLOCKS = int(os.environ.get("KT_BORROW_WATCH_MAX_BLOCKS", "5000"))
 
 
+# --- вотчер ставки: когда опцион получает дату ------------------------------------------
+# Замер 30.07: ни один рынок Katana не является таймером — коллатерал дорожает быстрее, чем
+# капает заём, и позиции у края самозалечиваются. Но запас тонкий: weETH/vbETH, где лежит 87%
+# денег чейна, идёт с перевесом всего +1.1%/год. Стоит утилизации подскочить — ставка обгонит
+# дрейф, и весь блок перестаёт быть лотереей: HF начинает падать ПО РАСПИСАНИЮ. Это смена
+# режима, а не движение цены, и увидеть её можно только сравнив две величины, которые проход
+# и так читает.
+RATE_WATCH_USD = float(os.environ.get("KT_RATE_WATCH_USD", "50"))
+RATE_WATCH_WINDOW_SEC = float(os.environ.get("KT_RATE_WATCH_WINDOW_SEC", "21600"))   # 6ч
+_YEAR = 31_536_000.0
+
+
+def _rate_watch(r: dict, st: dict, now_ts: float) -> None:
+    """Сравнить ставку займа с дрейфом оракула по рынкам, где у нас есть приз, и дать один
+    алерт на СМЕНУ знака (а не на каждый проход). Никогда не роняет проход."""
+    rates, prices = r.get("rates") or {}, r.get("prices") or {}
+    if not rates or not prices:
+        return
+    prize: dict[str, float] = {}
+    for x in r["targets"] + r["risk"]:
+        p = _prize_usd(x)
+        if p > 0:
+            prize[x["market_id"]] = max(prize.get(x["market_id"], 0.0), p)
+    base = st.setdefault("oracle_baseline", {})
+    flips = st.setdefault("rate_flip", {})
+    for mid, pz in prize.items():
+        if pz < RATE_WATCH_USD or mid not in rates or not prices.get(mid):
+            continue
+        px, rate = prices[mid], rates[mid]
+        b = base.get(mid)
+        if not b or b.get("px", 0) <= 0:
+            base[mid] = {"px": px, "ts": now_ts}       # первая засечка: сравнивать не с чем
+            continue
+        dt = now_ts - b["ts"]
+        if dt < RATE_WATCH_WINDOW_SEC:
+            continue                                   # окно ещё не набрано — шум задавит сигнал
+        drift_apr = (px / b["px"] - 1.0) * (_YEAR / dt) * 100.0
+        borrow_apr = rate * _YEAR / 1e18 * 100.0
+        base[mid] = {"px": px, "ts": now_ts}           # окно катится вперёд
+        flipped = borrow_apr > drift_apr
+        prev = flips.get(mid)
+        flips[mid] = flipped
+        if prev == flipped:
+            continue                                   # режим не менялся — молчим
+        if not flipped and prev is None:
+            continue        # первая оценка в нормальном режиме: сообщать не о чем. А вот
+            #                 первая оценка В ПЕРЕВЁРНУТОМ режиме — ровно то, ради чего вотчер
+            #                 и написан, и глушить её нельзя (поймано тестом).
+        if flipped:
+            alert(f"⏱ {_mkt_name(mid)}: ставка займа {borrow_apr:.2f}%/год ОБОГНАЛА дрейф "
+                  f"коллатерала {drift_apr:+.2f}%/год — цели на ${pz:,.0f} пошли вниз "
+                  f"по расписанию, а не по случаю")
+        else:
+            alert(f"⏱ {_mkt_name(mid)}: дрейф {drift_apr:+.2f}%/год снова обгоняет ставку "
+                  f"{borrow_apr:.2f}%/год — цели на ${pz:,.0f} опять самозалечиваются")
+
+
 def _hotset_log(r: dict) -> None:
     """Одна строка на API-проход: ЧТО именно попало в hot-петлю. Без неё «бот поднялся» не
     отличить от «кластер снова за кэпом» — 30.07 hot-петля читала 25 позиций из 560 и ни одной
@@ -2162,6 +2219,10 @@ def once(st: dict | None = None, mstate: dict | None = None,
     if not skip_api:
         _hotset_log(r)
         _borrow_watch(rpc, r, st)
+        try:
+            _rate_watch(r, st, now_ts)
+        except Exception as e:
+            print(f"  rate-watch fail: {e}")
     ok, reason = guard_ok(st)
     print(f"[{time.strftime('%H:%M:%S')}] block {r['block']} | positions {r['n_positions']} | "
           f"near-edge {len(r['risk'])} | targets(HF<1) {len(r['targets'])} | "

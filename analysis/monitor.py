@@ -365,9 +365,14 @@ def scan(rpc: Rpc | None = None, state: dict | None = None,
                  "pairs": ({m: sorted(bs) for m, bs in pairs.items() if bs}
                            if not skip_api else state.get("pairs", {})),
                  "hot_pairs": {m: sorted(bs) for m, bs in hot_pairs.items()}}
+    # ставки и цены оракулов отдаём наружу: проход и так их прочитал, а вотчер ставки
+    # (executor._rate_watch) сравнивает их между собой — второй раз ходить в сеть незачем
+    rates = {m: _words(ret)[0] for m, (ok, ret) in zip(rate_mids, rate_res)
+             if ok and len(ret) >= 66}
     return {"block": to, "from_block": state.get("last_block", -1) + 1, "targets": targets,
             "risk": risk, "liquidations": liquidations, "state": new_state,
-            "n_positions": len(raw_pos)}
+            "n_positions": len(raw_pos), "rates": rates, "prices": prices,
+            "chain_now": chain_now}
 
 
 def run_once(rpc: Rpc | None = None, state_path: str = STATE_PATH,
