@@ -26,6 +26,19 @@ interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
 }
 
+/// @notice Минимальный ERC-4626: выход из yv-вольтов идёт через redeem, а не через своп.
+/// @notice Выход через ERC-4626, одним параметром: девятый адрес в liquidate() упирался в
+/// «stack too deep», а включать via_ir ради двух полей — менять кодоген всего контракта.
+struct VaultExit {
+    address vault;       // 0 = коллатерал свопится как есть (поведение v1 бит-в-бит)
+    address asset;       // ожидаемый asset() вольта; сверяется он-чейн в колбэке
+}
+
+interface IERC4626 {
+    function asset() external view returns (address);
+    function redeem(uint256 shares, address receiver, address owner) external returns (uint256);
+}
+
 /// @title KatanaLiquidator — zero-capital Morpho Blue liquidations on Katana (chainId 747474).
 /// @notice Direct port of the production Base/Monad executor (Katana is standard EVM; the
 /// Morpho.sol liquidate callback flow is byte-identical). Flow:
@@ -56,12 +69,20 @@ contract KatanaLiquidator {
         bytes swapCallData;
         address loanToken;
         address collateralToken;
+        // v2: ERC-4626-коллатерал (yvvbUSDC/yvvbUSDT). У долей вольта НЕТ пула на Sushi —
+        // маршрут не существует в принципе, и такие рынки были для нас мертвы ($42.7k приза
+        // на 30.07). Выход: redeem доли -> базовый токен -> обычный своп. vault=0 =
+        // прежнее поведение бит-в-бит.
+        address vault;
+        address vaultAsset;       // ожидаемый asset() вольта; сверяется он-чейн
     }
 
     error NotOwner();
     error NotMorpho();
     error Reentrant();
     error SwapFailed();
+    error VaultAssetMismatch();
+    error RedeemFailed();
     error CannotRepay();
     error ProfitTooLow(uint256 got, uint256 min);
     error ERC20OpFailed();
@@ -112,14 +133,17 @@ contract KatanaLiquidator {
         uint256 repaidShares,
         address swapTarget,
         bytes calldata swapCallData,
-        uint256 minProfit
+        uint256 minProfit,
+        VaultExit calldata ve
     ) external onlyOwner nonReentrant returns (uint256 profit) {
         bytes memory data = abi.encode(
             SwapData({
                 swapTarget: swapTarget,
                 swapCallData: swapCallData,
                 loanToken: mp.loanToken,
-                collateralToken: mp.collateralToken
+                collateralToken: mp.collateralToken,
+                vault: ve.vault,
+                vaultAsset: ve.asset
             })
         );
 
@@ -131,10 +155,7 @@ contract KatanaLiquidator {
         profit = balAfter - balBefore;
         if (profit < minProfit) revert ProfitTooLow(profit, minProfit);
         _safeTransfer(mp.loanToken, owner, balAfter); // sweep everything (incl. any prior dust)
-        // sweep collateral dust too (swap-input haircut leaves ~0.3% of the seize here every
-        // liquidation — unswept it silently accrues as unhedged inventory)
-        uint256 collLeft = IERC20(mp.collateralToken).balanceOf(address(this));
-        if (collLeft != 0) _safeTransfer(mp.collateralToken, owner, collLeft);
+        _sweepLeftovers(mp.collateralToken, ve.asset, mp.loanToken);
         emit Liquidated(borrower, mp.loanToken, profit, seized, repaid);
     }
 
@@ -144,14 +165,44 @@ contract KatanaLiquidator {
         if (msg.sender != MORPHO) revert NotMorpho();
         SwapData memory s = abi.decode(data, (SwapData));
 
-        uint256 collBal = IERC20(s.collateralToken).balanceOf(address(this));
-        _forceApprove(s.collateralToken, s.swapTarget, collBal);
-        (bool ok, ) = s.swapTarget.call(s.swapCallData);
-        if (!ok) revert SwapFailed();
-        _forceApprove(s.collateralToken, s.swapTarget, 0); // drop dangling allowance
+        address tokenIn = s.collateralToken;
+        uint256 amountIn = IERC20(s.collateralToken).balanceOf(address(this));
+
+        // v2: ERC-4626-коллатерал выходит через redeem, а не через своп — у долей вольта нет
+        // пула. asset() сверяется он-чейн: подставить чужой vaultAsset в calldata нельзя.
+        if (s.vault != address(0)) {
+            if (IERC4626(s.vault).asset() != s.vaultAsset) revert VaultAssetMismatch();
+            amountIn = IERC4626(s.vault).redeem(amountIn, address(this), address(this));
+            if (amountIn == 0) revert RedeemFailed();
+            tokenIn = s.vaultAsset;
+        }
+
+        // База вольта МОЖЕТ совпасть с займом (yvvbUSDC -> vbUSDC при займе vbUSDC): тогда
+        // свопа нет вовсе — ни маршрута, ни проскальзывания, ни газа на роутер.
+        if (tokenIn != s.loanToken) {
+            _forceApprove(tokenIn, s.swapTarget, amountIn);
+            (bool ok, ) = s.swapTarget.call(s.swapCallData);
+            if (!ok) revert SwapFailed();
+            _forceApprove(tokenIn, s.swapTarget, 0); // drop dangling allowance
+        }
 
         if (IERC20(s.loanToken).balanceOf(address(this)) < repaidAssets) revert CannotRepay();
         _forceApprove(s.loanToken, MORPHO, repaidAssets); // Morpho pulls exactly this next
+    }
+
+
+    /// @dev Подмести остатки. Вынесено из liquidate() не ради красоты: с девятым параметром
+    /// кадр функции упирался в «stack too deep», а via_ir поменял бы кодоген всего контракта.
+    ///  * дребезг коллатерала — haircut входа свопа оставляет ~0.3% seize каждую ликвидацию;
+    ///  * базовый токен вольта — остаток redeem, если он не совпал с займом.
+    /// Неподметённое молча копится как нехеджированный остаток.
+    function _sweepLeftovers(address coll, address vaultAsset, address loan) private {
+        uint256 left = IERC20(coll).balanceOf(address(this));
+        if (left != 0) _safeTransfer(coll, owner, left);
+        if (vaultAsset != address(0) && vaultAsset != loan && vaultAsset != coll) {
+            left = IERC20(vaultAsset).balanceOf(address(this));
+            if (left != 0) _safeTransfer(vaultAsset, owner, left);
+        }
     }
 
     /// @notice Recover stuck tokens (dust collateral from a partial swap, airdrops) to owner.

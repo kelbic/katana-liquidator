@@ -2,7 +2,7 @@
 pragma solidity 0.8.23;
 
 import {Test, console} from "forge-std/Test.sol";
-import {KatanaLiquidator, MarketParams} from "../src/KatanaLiquidator.sol";
+import {KatanaLiquidator, MarketParams, VaultExit} from "../src/KatanaLiquidator.sol";
 
 struct Market {
     uint128 totalSupplyAssets; uint128 totalSupplyShares;
@@ -144,7 +144,7 @@ contract KatanaLiquidatorForkTest is Test {
 
         uint256 ownerBefore = loan.balanceOf(address(this));
         bytes memory swapData = abi.encodeWithSelector(MockSwapper.swapAll.selector);
-        uint256 profit = liq.liquidate(mp, borrower, 0, uint256(borrowShares), address(swapper), swapData, 0);
+        uint256 profit = liq.liquidate(mp, borrower, 0, uint256(borrowShares), address(swapper), swapData, 0, VaultExit(address(0), address(0)));
 
         (, uint128 sharesAfter,) = morpho.position(id, borrower);
         console.log("profit (loan wei):", profit);
@@ -165,7 +165,7 @@ contract KatanaLiquidatorForkTest is Test {
         (, , uint128 collBefore) = morpho.position(id, borrower);
         uint256 seizeArg = uint256(collBefore) * 997 / 1000;   // 0.3% headroom, like the bot
         bytes memory swapData = abi.encodeWithSelector(MockSwapper.swapAll.selector);
-        uint256 profit = liq.liquidate(mp, borrower, seizeArg, 0, address(swapper), swapData, 0);
+        uint256 profit = liq.liquidate(mp, borrower, seizeArg, 0, address(swapper), swapData, 0, VaultExit(address(0), address(0)));
 
         (, , uint128 collAfter) = morpho.position(id, borrower);
         console.log("capped-close profit (loan wei):", profit);
@@ -183,7 +183,7 @@ contract KatanaLiquidatorForkTest is Test {
         uint256 ownerCollBefore = coll.balanceOf(address(this));
         // pull only 99.7% of the seized collateral — the production haircut leaves ~0.3% dust
         bytes memory swapData = abi.encodeWithSelector(MockSwapper.swapPart.selector, uint256(9970));
-        liq.liquidate(mp, borrower, 0, uint256(borrowShares), address(swapper), swapData, 0);
+        liq.liquidate(mp, borrower, 0, uint256(borrowShares), address(swapper), swapData, 0, VaultExit(address(0), address(0)));
 
         assertEq(coll.balanceOf(address(liq)), 0, "dust stuck in contract");
         assertGt(coll.balanceOf(address(this)) - ownerCollBefore, 0, "dust not swept to owner");
@@ -197,7 +197,7 @@ contract KatanaLiquidatorForkTest is Test {
         (, uint128 borrowShares,) = morpho.position(id, borrower);
         bytes memory swapData = abi.encodeWithSelector(MockSwapper.swapAll.selector);
         vm.expectPartialRevert(KatanaLiquidator.ProfitTooLow.selector);  // THIS revert, any args
-        liq.liquidate(mp, borrower, 0, uint256(borrowShares), address(swapper), swapData, 1_000_000e18);
+        liq.liquidate(mp, borrower, 0, uint256(borrowShares), address(swapper), swapData, 1_000_000e18, VaultExit(address(0), address(0)));
     }
 
     function testOnlyOwnerAndOnlyMorpho() public {
@@ -205,7 +205,7 @@ contract KatanaLiquidatorForkTest is Test {
         bytes memory swapData = "";
         vm.prank(address(0xBAD));
         vm.expectRevert(KatanaLiquidator.NotOwner.selector);
-        liq.liquidate(mp, borrower, 0, 1, address(swapper), swapData, 0);
+        liq.liquidate(mp, borrower, 0, 1, address(swapper), swapData, 0, VaultExit(address(0), address(0)));
 
         vm.prank(address(0xBAD));
         vm.expectRevert(KatanaLiquidator.NotMorpho.selector);
@@ -252,5 +252,115 @@ contract SushiRealSwapForkTest is Test {
         console.log("real Sushi swap out (vbUSDC 6dec):", got);
         console.log("min acceptable:", minOut);
         assertGe(got, minOut, "sushi swap out below floor");
+    }
+}
+
+
+// ─── v2: выход из ERC-4626-коллатерала (yv-вольты) ───────────────────────────────────────
+// 30.07: рынки yvvbUSDC/vbUSDT и yvvbUSDT/vbUSDC ($42.7k приза) были для нас мертвы — у долей
+// вольта НЕТ пула на Sushi, маршрут не существует в принципе. Выход только через redeem.
+
+contract MockVault {
+    MockERC20 public immutable ASSET;
+    address public assetOverride;
+    uint256 public rate;
+    bool public returnsZero;
+    mapping(address => uint256) public balanceOf;
+    constructor(MockERC20 a, uint256 r) { ASSET = a; rate = r; }
+    function asset() external view returns (address) {
+        return assetOverride == address(0) ? address(ASSET) : assetOverride;
+    }
+    function setAssetOverride(address a) external { assetOverride = a; }
+    function setReturnsZero(bool z) external { returnsZero = z; }
+    function mint(address to, uint256 amt) external { balanceOf[to] += amt; }
+    function redeem(uint256 shares, address receiver, address from) external returns (uint256) {
+        balanceOf[from] -= shares;
+        if (returnsZero) return 0;
+        uint256 out = shares * rate / 1e18;
+        ASSET.mint(receiver, out);
+        return out;
+    }
+}
+
+contract VaultExitTest is Test {
+    KatanaLiquidator liq;
+    MockERC20 loan;
+    MockERC20 vaultAsset;
+    MockVault vault;
+    address owner = address(0xB0B);
+
+    function setUp() public {
+        loan = new MockERC20();
+        vaultAsset = new MockERC20();
+        vault = new MockVault(vaultAsset, 1.02e18);      // доля дороже базы, как у yv
+        vm.prank(owner);
+        liq = new KatanaLiquidator(address(this));       // MORPHO = сам тест
+    }
+
+    function _data(address vaultAddr, address assetAddr, address swapTarget)
+        internal view returns (bytes memory)
+    {
+        return abi.encode(
+            KatanaLiquidator.SwapData({
+                swapTarget: swapTarget,
+                swapCallData: abi.encodeWithSignature("swapAll()"),
+                loanToken: address(loan),
+                collateralToken: address(vault),
+                vault: vaultAddr,
+                vaultAsset: assetAddr
+            })
+        );
+    }
+
+    function testRedeemThenSwapPath() public {
+        MockSwapper sw = new MockSwapper(vaultAsset, loan, 1e18);
+        loan.mint(address(sw), 1_000e18);
+        vault.mint(address(liq), 100e18);
+        liq.onMorphoLiquidate(1e18, _data(address(vault), address(vaultAsset), address(sw)));
+        assertEq(vault.balanceOf(address(liq)), 0, unicode"доли не сожжены");
+        assertEq(loan.balanceOf(address(liq)), 102e18, unicode"заём не получен по курсу вольта");
+    }
+
+    function testAssetMismatchReverts() public {
+        vault.setAssetOverride(address(0xDEAD));         // вольт говорит не то, что в calldata
+        MockSwapper sw = new MockSwapper(vaultAsset, loan, 1e18);
+        vault.mint(address(liq), 100e18);
+        vm.expectRevert(KatanaLiquidator.VaultAssetMismatch.selector);
+        liq.onMorphoLiquidate(1e18, _data(address(vault), address(vaultAsset), address(sw)));
+    }
+
+    function testZeroRedeemReverts() public {
+        vault.setReturnsZero(true);
+        MockSwapper sw = new MockSwapper(vaultAsset, loan, 1e18);
+        vault.mint(address(liq), 100e18);
+        vm.expectRevert(KatanaLiquidator.RedeemFailed.selector);
+        liq.onMorphoLiquidate(1e18, _data(address(vault), address(vaultAsset), address(sw)));
+    }
+
+    /// база вольта СОВПАЛА с займом: свопа быть не должно вовсе — ни маршрута, ни газа.
+    /// swapTarget указывает в пустоту: если код всё-таки попробует свопнуть, тест упадёт.
+    function testNoSwapWhenVaultAssetIsTheLoan() public {
+        MockVault v2 = new MockVault(loan, 1.02e18);
+        v2.mint(address(liq), 100e18);
+        bytes memory data = abi.encode(
+            KatanaLiquidator.SwapData({
+                swapTarget: address(0xBAD),
+                swapCallData: abi.encodeWithSignature("swapAll()"),
+                loanToken: address(loan),
+                collateralToken: address(v2),
+                vault: address(v2),
+                vaultAsset: address(loan)
+            })
+        );
+        liq.onMorphoLiquidate(1e18, data);
+        assertEq(loan.balanceOf(address(liq)), 102e18, unicode"redeem не дал заём напрямую");
+    }
+
+    function testCannotRepayStillReverts() public {
+        MockSwapper sw = new MockSwapper(vaultAsset, loan, 1e18);
+        loan.mint(address(sw), 1_000e18);
+        vault.mint(address(liq), 100e18);
+        vm.expectRevert(KatanaLiquidator.CannotRepay.selector);
+        liq.onMorphoLiquidate(1_000e18, _data(address(vault), address(vaultAsset), address(sw)));
     }
 }

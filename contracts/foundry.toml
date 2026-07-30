@@ -5,6 +5,10 @@ test = "test"
 script = "script"
 libs = ["lib"]
 solc = "0.8.23"
+# v2 (30.07): у liquidate() девять параметров (добавлен VaultExit под yv-вольты) и кадр
+# упирался в «stack too deep». via_ir — штатное лекарство; контракт всё равно деплоится
+# заново, а поведение проверяют сьют и форк-реплей.
+via_ir = true
 optimizer = true
 optimizer_runs = 200
 fs_permissions = [{ access = "read", path = "./" }]
