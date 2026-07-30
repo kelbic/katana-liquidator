@@ -2667,15 +2667,19 @@ class TestBorrowWatch(unittest.TestCase):
         return {"block": block, "targets": [], "risk": [t], "state": {}}, t
 
     def _run(self, logs, st, r):
-        sent = []
+        """Возвращает СТРОКИ ЛОГА: событие отрабатывает бот, человеку сообщать нечего.
+        Заодно ловим регресс — если кто-то вернёт сюда alert(), тест упадёт."""
+        sent, buf = [], io.StringIO()
         save_alert, save_logs = ex.alert, ex.get_logs_chunked
         try:
             ex.alert = lambda msg, **kw: sent.append(msg)
             ex.get_logs_chunked = lambda *a, **k: logs
-            ex._borrow_watch(object(), r, st)
+            with contextlib.redirect_stdout(buf):
+                ex._borrow_watch(object(), r, st)
         finally:
             ex.alert, ex.get_logs_chunked = save_alert, save_logs
-        return sent
+        assert not sent, f"BORROW не должен уходить в Telegram: {sent}"
+        return [l for l in buf.getvalue().splitlines() if "BORROW" in l]
 
     @staticmethod
     def _borrow_log(market_id, borrower, block=100):

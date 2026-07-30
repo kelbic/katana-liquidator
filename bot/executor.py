@@ -973,9 +973,13 @@ def _borrow_watch(rpc: Rpc, r: dict, st: dict) -> None:
         prize = watch.get(d["market_id"], {}).get(d["borrower"])
         if prize is None:
             continue
-        alert(f"🧨 BORROW {d['borrower'][:10]}… до-занял на рынке "
-              f"{_mkt_name(d['market_id'])} — он у края, приз ~${prize:,.0f} "
-              f"(blk {d['block']} {d['tx'][:12]}…)")
+        # В ЛОГ, НЕ В TG (правило kelbic 30.07): алерт нужен там, где нужен ЧЕЛОВЕК.
+        # Это событие бот отрабатывает сам — позиция в hot-наборе, опрос 0.3с, лестница
+        # чанков подберёт размер; человек на «он в 0.06% от линии» не делает ничего.
+        # Сигналить надо по ИСХОДУ (выстрел, проигранная гонка), а не по предвестнику.
+        # Запись остаётся: когда пересечение случится, история шагов плеча — это форензика.
+        print(f"  🧨 BORROW {d['borrower'][:10]}… до-занял на {_mkt_name(d['market_id'])} "
+              f"— у края, приз ~${prize:,.0f} (blk {d['block']} {d['tx'][:12]}…)")
 
 
 SEL_PREVIEW_REDEEM = selector("previewRedeem(uint256)")
