@@ -138,12 +138,27 @@ def encode_borrow_rate_view(p: dict, mkt: dict) -> str:
 
 # Coarse env prices for non-stable loan sizing (MIN_DEBT gate + target ordering ONLY — the
 # profit gates in bot/executor.py use live Sushi quotes, never these).
+#
+# ГРАНИЦА (доктрина kelbic 30.07): пул-цена годится ТОЛЬКО для ранжирования и префильтра.
+# Истина по прибыли — evaluate() с реальной квотой выхода. Мы торгуем в тот же пул, откуда
+# берём цену: если пустить пул-цену в гейт прибыли, собственный сдвиг пула начнёт
+# «подтверждать» прибыльность следующего чанка — петля положительной обратной связи.
 ETH_USD_APPROX = float(os.environ.get("KT_ETH_USD", "3300"))
 BTC_USD_APPROX = float(os.environ.get("KT_BTC_USD", "100000"))
+# KAT: сид для холодного старта, живое значение прилетает из executor.refresh_kat_usd()
+# через set_token_usd() (замер 30.07: $0.004515 на пробе 100k, impact 0.28%).
+KAT_USD_APPROX = float(os.environ.get("KT_KAT_USD", "0.0045"))
 _APPROX_USD = {TOKENS["vbETH"]["address"].lower(): ETH_USD_APPROX,
                TOKENS["weETH"]["address"].lower(): ETH_USD_APPROX,
                TOKENS["vbWBTC"]["address"].lower(): BTC_USD_APPROX,
-               TOKENS["LBTC"]["address"].lower(): BTC_USD_APPROX}
+               TOKENS["LBTC"]["address"].lower(): BTC_USD_APPROX,
+               TOKENS["KAT"]["address"].lower(): KAT_USD_APPROX}
+
+
+def set_token_usd(addr: str, usd: float) -> None:
+    """Подставить свежую цену токена для РАНЖИРОВАНИЯ (hot-set, гейт MIN_DEBT, порядок целей).
+    Вызывается из бота после живой котировки; на решение о прибыли не влияет — см. границу выше."""
+    _APPROX_USD[addr.lower()] = usd
 
 
 def debt_usd(loan_addr: str, debt_assets: int) -> float | None:

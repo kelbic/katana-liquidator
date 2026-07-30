@@ -17,7 +17,8 @@ os.environ.setdefault("KT_MIN_PROFIT_USD", "20")
 os.environ.setdefault("KT_MAX_IMPACT", "0.02")
 os.environ.setdefault("KT_CONTRACT", "0x000000000000000000000000000000000000bEEF")
 
-from analysis.protocols import MARKETS  # noqa: E402
+from analysis import monitor  # noqa: E402
+from analysis.protocols import MARKETS, TOKENS  # noqa: E402
 from bot import executor as ex  # noqa: E402
 from bot.mempool import OracleSignal  # noqa: E402
 
@@ -698,19 +699,27 @@ class _ArmRpc:
         return int(0.001e9)
 
 
-def _hot_row(hf=1.0005, debt_usd=61000.0):
-    t = _target(1.0, 61000.0)
+def _hot_row(hf=1.0005, debt_usd=61000.0, lltv=860000000000000000, loan=None):
+    # repaid ДОЛЖЕН следовать за debt_usd: очередь ранжируется призом (LIF−1)×repaid, и
+    # фикстура с фиксированным repaid сделала бы порядок неотличимым от порядка вставки.
+    t = _target(1.0, 61000.0 if debt_usd is None else debt_usd)
     t["hf"] = hf
     t["debt_usd"] = debt_usd
+    t["lltv"] = lltv
+    if loan is not None:
+        t["loan"] = loan
     t["collateral"] = int(1.2e8)     # 1.2 vbWBTC backing the ~1 BTC full-close seize
     return t
+
+
+UNPRICEABLE = "0x" + "77" * 20      # займ, которого нет в TOKENS -> _prize_usd == 0
 
 
 class TestArmCandidates(unittest.TestCase):
     def test_window_gate_and_order(self):
         rows = [_hot_row(0.998, 9000),      # already flipped — classic path's job
                 _hot_row(1.0005, 2000), _hot_row(1.0015, 8000),
-                _hot_row(1.0019, None),     # unknown USD — still watched (like once())
+                _hot_row(1.0019, None, loan=UNPRICEABLE),   # unknown USD — still watched
                 _hot_row(1.0005, 100),      # below MIN_DEBT gate
                 _hot_row(1.01, 50000)]      # outside KT_ARM_HF
         cands = ex._arm_candidates(rows)
@@ -724,6 +733,23 @@ class TestArmCandidates(unittest.TestCase):
             self.assertEqual([r["debt_usd"] for r in ex._arm_candidates(rows)], [3000, 2000])
         finally:
             ex.ARM_MAX_N = save
+
+    def test_rank_is_prize_not_debt(self):
+        """Долг ≠ приз: при lltv 0.98 приз 0.6% от долга, при 0.77 — 7.4%. Кэп пре-арма режет
+        ХВОСТ, поэтому ранжирование долгом уводило из-под арма меньшую, но вдвое более
+        доходную цель (30.07: так пропал весь кластер avKAT/KAT)."""
+        big_cheap = _hot_row(1.001, 100_000, lltv=980000000000000000)   # приз ~$604
+        small_rich = _hot_row(1.001, 20_000, lltv=770000000000000000)   # приз ~$1,482
+        order = ex._arm_candidates([big_cheap, small_rich])
+        self.assertEqual([r["debt_usd"] for r in order], [20_000, 100_000])
+        self.assertGreater(ex._prize_usd(small_rich), ex._prize_usd(big_cheap))
+
+    def test_unpriceable_goes_last_but_never_drops(self):
+        """Непрайсуемый займ ранжируется нулём — но остаётся в списке (раньше он и в
+        сортировке был нулём, и это было ЕДИНСТВЕННОЕ, что о нём знали)."""
+        rows = [_hot_row(1.001, None, loan=UNPRICEABLE), _hot_row(1.001, 5_000)]
+        self.assertEqual([r["debt_usd"] for r in ex._arm_candidates(rows)], [5_000, None])
+        self.assertEqual(ex._prize_usd(rows[0]), 0.0)
 
 
 class TestPredictPreArm(unittest.TestCase):
@@ -2539,3 +2565,190 @@ class TestReceiptPnl(unittest.TestCase):
         for bad in ({}, {"gasUsed": "нечисло"}, {"gasUsed": "0x1", "logs": "не список"},
                     {"gasUsed": "0x1", "effectiveGasPrice": "0x1", "logs": [{"topics": []}]}):
             self.assertIsInstance(ex._receipt_pnl(bad), str)
+
+
+class TestLoanPricing(unittest.TestCase):
+    """30.07: непрайсуемый займ был корнем ДВУХ дыр сразу — пол прибыли вырождался в 1 wei
+    и сортировка hot-set/пре-арма роняла такие цели на дно (кластер avKAT/KAT: #383 из 386).
+    Граница доктрины: цена нужна для перевода порога $ в wei и для РАНЖИРОВАНИЯ; прибыль
+    считает evaluate() по реальной квоте выхода."""
+
+    def test_ausd_is_a_dollar(self):
+        ausd = TOKENS["AUSD"]["address"]
+        self.assertEqual(ex._loan_usd_px(ausd), 1.0)
+        self.assertEqual(ex._loan_usd_px(ausd.lower()), 1.0)
+
+    def test_kat_uses_refreshed_price(self):
+        save = ex.KAT_USD
+        try:
+            ex.KAT_USD = 0.0072
+            self.assertAlmostEqual(ex._loan_usd_px(TOKENS["KAT"]["address"]), 0.0072)
+        finally:
+            ex.KAT_USD = save
+
+    def test_unknown_token_still_none(self):
+        self.assertIsNone(ex._loan_usd_px("0x" + "77" * 20))
+
+    def test_floor_no_longer_degenerates(self):
+        """Ради чего всё: $20 порога должны превращаться в реальные wei займа, а не в 1."""
+        for addr, px in ((TOKENS["AUSD"]["address"], 1.0), (TOKENS["KAT"]["address"], ex.KAT_USD)):
+            dec = ex._TOKEN_DEC[addr.lower()]
+            floor = max(1, int(ex.MIN_PROFIT_USD / px * 10 ** dec))
+            self.assertGreater(floor, 1)
+
+    def test_refresh_kat_usd_bands_and_publishes(self):
+        """Живая котировка принимается только в разумном коридоре и уходит в ранжирование
+        монитора; мусорная цена НЕ затирает прошлую (иначе один кривой ответ роутера
+        перекосил бы и порог, и очередь)."""
+        save_px, save_ts = ex.KAT_USD, ex._kat_usd_ts
+        save_q = ex.quote
+        try:
+            for out_usdc, expect in ((452.0, 0.00452), (0.0, None), (10 ** 9, None)):
+                ex.KAT_USD, ex._kat_usd_ts = 0.0045, 0.0
+                ex.quote = lambda *a, **k: {"amount_out": int(out_usdc * 1e6),
+                                            "price_impact": 0.003, "gas": 1,
+                                            "swap_target": "0x", "swap_calldata": "0x"}
+                ex.refresh_kat_usd()
+                if expect is None:
+                    self.assertEqual(ex.KAT_USD, 0.0045)
+                else:
+                    self.assertAlmostEqual(ex.KAT_USD, expect, places=8)
+                    self.assertAlmostEqual(
+                        monitor._APPROX_USD[TOKENS["KAT"]["address"].lower()], expect, places=8)
+        finally:
+            ex.quote, ex.KAT_USD, ex._kat_usd_ts = save_q, save_px, save_ts
+            monitor.set_token_usd(TOKENS["KAT"]["address"], save_px)
+
+    def test_refresh_respects_ttl(self):
+        save_px, save_ts, save_q = ex.KAT_USD, ex._kat_usd_ts, ex.quote
+        try:
+            ex.KAT_USD, ex._kat_usd_ts = 0.0045, time.time()
+            ex.quote = lambda *a, **k: self.fail("котировка не должна дёргаться внутри TTL")
+            ex.refresh_kat_usd()
+            self.assertEqual(ex.KAT_USD, 0.0045)
+        finally:
+            ex.quote, ex.KAT_USD, ex._kat_usd_ts = save_q, save_px, save_ts
+
+
+class TestPoolBusyCascade(unittest.TestCase):
+    """Форк 30.07: два выстрела подряд в один тонкий пул — второй ревертит по min-out
+    роутера (0x63ecb9f6). Квота построена на состоянии ДО нашей же невключённой транзакции;
+    переквота внутри того же прохода не спасает — спасает только ожидание включения."""
+
+    def setUp(self):
+        ex._pool_busy_until.clear()
+
+    tearDown = setUp
+
+    def test_marks_and_expires(self):
+        now = 1000.0
+        self.assertFalse(ex._pool_busy("0xAA", "0xBB", now))
+        ex._pool_note("0xAA", "0xBB", now)
+        self.assertTrue(ex._pool_busy("0xaa", "0xbb", now + ex.POOL_BUSY_TTL - 0.1))
+        self.assertFalse(ex._pool_busy("0xAA", "0xBB", now + ex.POOL_BUSY_TTL))
+
+    def test_other_pair_is_free(self):
+        ex._pool_note("0xAA", "0xBB", 1000.0)
+        self.assertFalse(ex._pool_busy("0xCC", "0xBB", 1000.0))
+        self.assertFalse(ex._pool_busy("0xAA", "0xCC", 1000.0))
+
+    def test_expiry_is_cleaned_up(self):
+        ex._pool_note("0xAA", "0xBB", 1000.0)
+        ex._pool_busy("0xAA", "0xBB", 1000.0 + ex.POOL_BUSY_TTL)
+        self.assertEqual(ex._pool_busy_until, {})
+
+
+class TestBorrowWatch(unittest.TestCase):
+    """Детонатор заплечённого кластера — не цена (дрейф HF +0.0027/день ВВЕРХ), а
+    до-заём самого владельца."""
+
+    def _rows(self, block=100, prize_loan=None):
+        t = _hot_row(1.0014, 120_000, lltv=770000000000000000, loan=prize_loan)
+        return {"block": block, "targets": [], "risk": [t], "state": {}}, t
+
+    def _run(self, logs, st, r):
+        sent = []
+        save_alert, save_logs = ex.alert, ex.get_logs_chunked
+        try:
+            ex.alert = lambda msg, **kw: sent.append(msg)
+            ex.get_logs_chunked = lambda *a, **k: logs
+            ex._borrow_watch(object(), r, st)
+        finally:
+            ex.alert, ex.get_logs_chunked = save_alert, save_logs
+        return sent
+
+    @staticmethod
+    def _borrow_log(market_id, borrower, block=100):
+        return {"blockNumber": hex(block), "transactionHash": "0x" + "ab" * 32,
+                "topics": ["0x" + "00" * 32, market_id,
+                           "0x" + "0" * 24 + borrower[2:], "0x" + "0" * 64],
+                "data": "0x" + "0" * 128}
+
+    def test_alerts_on_watched_borrower(self):
+        r, t = self._rows()
+        st = {"borrow_watch_block": 90}
+        sent = self._run([self._borrow_log(t["market_id"], t["borrower"])], st, r)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("BORROW", sent[0])
+        self.assertIn(t["borrower"][:10], sent[0])
+        self.assertEqual(st["borrow_watch_block"], 100)
+
+    def test_silent_on_stranger(self):
+        r, t = self._rows()
+        sent = self._run([self._borrow_log(t["market_id"], "0x" + "99" * 20)],
+                         {"borrow_watch_block": 90}, r)
+        self.assertEqual(sent, [])
+
+    def test_first_pass_only_sets_the_mark(self):
+        """Холодный старт не имеет права выплюнуть историю окна одним залпом."""
+        r, t = self._rows()
+        st = {}
+        sent = self._run([self._borrow_log(t["market_id"], t["borrower"])], st, r)
+        self.assertEqual(sent, [])
+        self.assertEqual(st["borrow_watch_block"], 100)
+
+    def test_gap_too_wide_is_skipped(self):
+        r, t = self._rows(block=10 ** 6)
+        st = {"borrow_watch_block": 1}
+        self.assertEqual(self._run([self._borrow_log(t["market_id"], t["borrower"])], st, r), [])
+        self.assertEqual(st["borrow_watch_block"], 10 ** 6)
+
+    def test_below_threshold_is_not_watched(self):
+        r, t = self._rows(prize_loan="0x" + "77" * 20)      # непрайсуем -> приз 0
+        self.assertEqual(self._run([self._borrow_log(t["market_id"], t["borrower"])],
+                                   {"borrow_watch_block": 90}, r), [])
+
+    def test_getlogs_failure_never_breaks_the_pass(self):
+        r, t = self._rows()
+        st = {"borrow_watch_block": 90}
+        save = ex.get_logs_chunked
+        try:
+            def boom(*a, **k):
+                raise RuntimeError("429")
+            ex.get_logs_chunked = boom
+            ex._borrow_watch(object(), r, st)     # не должно бросить
+        finally:
+            ex.get_logs_chunked = save
+
+
+class TestHotsetLog(unittest.TestCase):
+    """«Бот поднялся» — не доказательство, что цель внутри петли. Строка HOTSET показывает
+    СОСТАВ hot-набора, чтобы кластер за кэпом было видно в логе, а не только в отладке."""
+
+    def _capture(self, r):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ex._hotset_log(r)
+        return buf.getvalue()
+
+    def test_lists_markets_and_top_prize(self):
+        t = _hot_row(1.0014, 120_000, lltv=770000000000000000)
+        r = {"block": 1, "targets": [], "risk": [t],
+             "state": {"hot_pairs": {t["market_id"]: [t["borrower"]]}}}
+        out = self._capture(r)
+        self.assertIn("HOTSET 1", out)
+        self.assertIn(t["borrower"][:8], out)
+        self.assertIn("приз $", out)
+
+    def test_no_hot_pairs_is_silent(self):
+        self.assertEqual(self._capture({"block": 1, "targets": [], "risk": [], "state": {}}), "")

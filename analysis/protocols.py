@@ -34,11 +34,17 @@ TOKENS = {
     "stcUSD": {"address": "0x88887bE419578051FF9F4eb6C858A951921D8888", "decimals": 18},
     "KAT":    {"address": "0x7F1f4b4b29f5058fA32CC7a97141b8D7e5ABDC2d", "decimals": 18},
     "avKAT":  {"address": "0x7231dbaCdFc968E07656D12389AB20De82FbfCeB", "decimals": 18},
+    # Agora USD — заём внереестровых рынков, где мы уже стреляли (LBTC/AUSD 29.07). Пока
+    # он был неизвестен, debt_usd/loan_px возвращали None: пол прибыли вырождался в 1 wei,
+    # а сортировка hot-set роняла такие позиции на дно (30.07). Курс сверен живой
+    # котировкой: $0.999956 на 1k, $0.999474 на 50k.
+    "AUSD":   {"address": "0x00000000eFE302BEAA2b3e6e1b18d08D69a9012a", "decimals": 6},
 }
 ADDR_TO_SYMBOL = {v["address"].lower(): k for k, v in TOKENS.items()}
 
 # Stablecoin loan tokens (USD ≈ 1) — USD sizing of debt is reliable here.
-STABLES = {TOKENS["vbUSDC"]["address"].lower(), TOKENS["vbUSDT"]["address"].lower()}
+STABLES = {TOKENS["vbUSDC"]["address"].lower(), TOKENS["vbUSDT"]["address"].lower(),
+           TOKENS["AUSD"]["address"].lower()}
 
 # --- target markets (full marketId from Morpho GraphQL; the liquidation opportunity set) --
 # Ranked by realised 90d liquidation bonus + exit depth. lltv drives LIF (see models.py).

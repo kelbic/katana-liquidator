@@ -97,10 +97,12 @@ sys.path.insert(0, REPO)
 
 from analysis.keccak import event_topic0, selector                     # noqa: E402
 from analysis.models import lif_from_lltv                              # noqa: E402
+from analysis import monitor                                          # noqa: E402
 from analysis.monitor import scan, load_state as load_monitor_state    # noqa: E402
 from analysis.multicall import MULTICALL3                              # noqa: E402
-from analysis.protocols import MARKETS, MORPHO, STABLES, TOKENS        # noqa: E402
-from analysis.rpc import DEFAULT_RPCS, Rpc                             # noqa: E402
+from analysis.protocols import (MARKETS, MORPHO, STABLES, TOKENS,      # noqa: E402
+                                TOPIC_MORPHO_BORROW, decode_morpho_borrow)
+from analysis.rpc import DEFAULT_RPCS, Rpc, get_logs_chunked           # noqa: E402
 from bot import fastpath                                               # noqa: E402
 from bot import oracles                                               # noqa: E402
 from bot.sushi import (quote, NoRouteError, PartialRouteError,        # noqa: E402
@@ -206,6 +208,10 @@ CHECKPOINT_BLOCK = os.environ.get("KT_CHECKPOINT_BLOCK")
 # ETH/USD seed for gas math AND the non-stable (vbETH-loan) profit floor; refreshed from a live
 # Sushi quote every ~5min by the loop (review H1) — the env value is only the cold-start seed.
 ETH_USD = float(os.environ.get("KT_ETH_USD", "3300"))
+# То же для KAT — заём рынка avKAT/KAT, где 30.07 найден кластер из 7 заплечённых позиций
+# (приз $9.9k гросс). Пока KAT был непрайсуем, пол прибыли по нему вырождался в 1 wei, а
+# сортировка hot-set роняла весь кластер за кэп HOT_MAX_N (#383 из 386).
+KAT_USD = float(os.environ.get("KT_KAT_USD", "0.0045"))
 
 # --- v3 latency upgrade: predictive block-boundary detect + pre-armed fire fast path ---
 # MEASURED (probe harness ~/.katana-probe, 551 probes, 2026-07-16/17): a tx lands in the NEXT
@@ -622,23 +628,35 @@ def gas_cost_usd(rpc: Rpc) -> float:
 
 # --- loan-token USD pricing (floors/gates; profit math itself is quote-based) --
 _ETH_LIKE = {TOKENS["vbETH"]["address"].lower(), TOKENS["weETH"]["address"].lower()}
+_KAT = TOKENS["KAT"]["address"].lower()
 _eth_usd_ts = 0.0
+_kat_usd_ts = 0.0
 
 
 def _loan_usd_px(addr: str) -> float | None:
-    """USD per whole loan token: stables $1; vbETH/weETH via the refreshed ETH_USD; else None.
+    """USD per whole loan token: stables $1 (vbUSDC/vbUSDT/AUSD); vbETH/weETH via the refreshed
+    ETH_USD; KAT via the refreshed KAT_USD; else None.
     Without this, non-stable loans (i.e. the flagship weETH/vbETH market) had NO usd floor —
-    min profit degenerated to 1 wei and the on-chain floor to net//2 alone (review H1)."""
+    min profit degenerated to 1 wei and the on-chain floor to net//2 alone (review H1).
+    Цена нужна здесь ТОЛЬКО чтобы перевести порог $MIN_PROFIT в wei займа. Сама прибыль
+    (net_wei) приходит из реальной квоты выхода, не отсюда — см. границу в monitor.py."""
     a = addr.lower()
     if a in STABLES:
         return 1.0
     if a in _ETH_LIKE:
         return ETH_USD
+    if a == _KAT:
+        return KAT_USD
     return None
 
 
 # --- competitor-race prize (the on-the-table bonus of a race we did NOT win) ----------------
 _MARKET_BY_ID = {m["id"].lower(): m for m in MARKETS.values()}
+_MKT_NAME = {v["id"].lower(): k for k, v in MARKETS.items()}
+
+
+def _mkt_name(mid: str) -> str:
+    return _MKT_NAME.get(mid.lower(), mid[:10])
 _SYM_TOKEN = {sym: tok for sym, tok in TOKENS.items()}
 
 
@@ -752,6 +770,33 @@ def refresh_eth_usd() -> None:
         print(f"eth_usd refresh fail: {e}")
 
 
+# Проба фиксированного РАЗМЕРА, не нашего сайза сделки: цена берётся из того же пула, куда
+# мы торгуем, и проба размером с наш выстрел двигала бы её сама. 100k KAT = impact 0.28%
+# (замер 30.07). Вызывается только на API-проходе (не в hot-петле и не в fire-пути), поэтому
+# значение всегда снято ДО выстрела, а не после собственного сдвига пула.
+_KAT_PROBE = 100_000 * 10 ** 18
+
+
+def refresh_kat_usd() -> None:
+    """Refresh KAT_USD from a live Sushi KAT->vbUSDC quote (5min TTL). Кормит ранжирование
+    hot-set/целей и перевод порога $MIN_PROFIT в wei; прибыльность решает evaluate()."""
+    global KAT_USD, _kat_usd_ts
+    if time.time() - _kat_usd_ts < 300:
+        return
+    _kat_usd_ts = time.time()          # even on failure — don't re-try every pass
+    try:
+        q = quote(TOKENS["KAT"]["address"], TOKENS["vbUSDC"]["address"], _KAT_PROBE,
+                  sender="0x000000000000000000000000000000000000dEaD",
+                  recipient="0x000000000000000000000000000000000000dEaD",
+                  max_slippage=0.005, timeout=QUOTE_TIMEOUT, retries=1)
+        v = q["amount_out"] / 1e6 / (_KAT_PROBE / 10 ** 18)
+        if 0.0001 < v < 1.0:
+            KAT_USD = v
+            monitor.set_token_usd(TOKENS["KAT"]["address"], v)
+    except Exception as e:
+        print(f"kat_usd refresh fail: {e}")
+
+
 # --- Sushi 'Partial' memo (review B) ------------------------------------------
 # status=Partial means the router can fill only PART of amountIn — persistent for a given
 # (pair, size) (route liquidity), NOT a transient error. Re-quoting the same too-big sizes
@@ -763,6 +808,108 @@ def refresh_eth_usd() -> None:
 # is NEVER used as a full fill — economics are untouched, this only skips doomed round-trips.
 # Main-thread only (evaluate runs in the main loop's classic + arm paths).
 _partial_floor: dict[tuple[str, str], tuple[int, float]] = {}   # (coll,loan)->(min_amt, expiry)
+
+
+# --- каскад: «пул сдвинут нашим же выстрелом» -------------------------------------------
+# Отличие от _partial_floor выше: тот помнит размеры, которые роутер НЕ наливает в принципе.
+# Этот помнит, что мы сами только что продали в эту пару и наша транзакция ещё не включена —
+# любая новая квота построена на пред-выстрельном состоянии пула. Живёт до включения
+# (POOL_BUSY_TTL ~ несколько блоков), потом следующий проход честно переквотит.
+POOL_BUSY_TTL = float(os.environ.get("KT_POOL_BUSY_TTL", "20"))
+_pool_busy_until: dict[tuple[str, str], float] = {}
+
+
+def _pool_note(coll: str, loan: str, now_ts: float) -> None:
+    _pool_busy_until[(coll.lower(), loan.lower())] = now_ts + POOL_BUSY_TTL
+
+
+def _pool_busy(coll: str, loan: str, now_ts: float) -> bool:
+    until = _pool_busy_until.get((coll.lower(), loan.lower()))
+    if until is None:
+        return False
+    if now_ts >= until:
+        del _pool_busy_until[(coll.lower(), loan.lower())]
+        return False
+    return True
+
+
+# --- ранг цели: приз, а не размер долга -------------------------------------------------
+_TOKEN_DEC = {v["address"].lower(): v["decimals"] for v in TOKENS.values()}
+
+
+def _prize_usd(t: dict) -> float:
+    """(LIF−1)×repaid в USD — сколько цель РЕАЛЬНО кладёт нам, а не сколько она должна.
+    Ранжирование и только оно: сортировка очереди выстрелов и отбор кандидатов на пре-арм.
+    0.0, когда займ непрайсуем (такие цели идут в хвост, но из очереди не выпадают).
+    Долг ≠ приз: при lltv 0.915 приз 2.6% от долга, при 0.77 — 7.4%."""
+    px = _loan_usd_px(t.get("loan", ""))
+    dec = _TOKEN_DEC.get(str(t.get("loan", "")).lower())
+    if px is None or dec is None or not t.get("repaid_assets"):
+        return 0.0
+    lif = t.get("lif") or lif_from_lltv(t["lltv"])
+    return (lif - 1.0) * t["repaid_assets"] / 10 ** dec * px
+
+
+# --- вотчер Borrow: детонатор заплечённого кластера ------------------------------------
+# Позиции, живущие на HF 1.001–1.04, сами вниз не идут: цена доли вольта растёт быстрее,
+# чем капают проценты (замер 30.07: дрейф HF +0.0027/день). Вниз их толкает СОБСТВЕННЫЙ
+# до-заём владельца — в истории видно, как заёмщик уронил себе HF 1.029→1.0128 за неделю.
+# Значит самый ранний сигнал — событие Borrow от того, кого мы и так держим у края.
+BORROW_WATCH_USD = float(os.environ.get("KT_BORROW_WATCH_USD", "50"))
+BORROW_WATCH_MAX_BLOCKS = int(os.environ.get("KT_BORROW_WATCH_MAX_BLOCKS", "5000"))
+
+
+def _hotset_log(r: dict) -> None:
+    """Одна строка на API-проход: ЧТО именно попало в hot-петлю. Без неё «бот поднялся» не
+    отличить от «кластер снова за кэпом» — 30.07 hot-петля читала 25 позиций из 560 и ни одной
+    из семи целей рынка avKAT/KAT, потому что непрайсуемый долг сортировался как ноль."""
+    hp = r.get("state", {}).get("hot_pairs") or {}
+    if not hp:
+        return
+    inside = [x for x in r["targets"] + r["risk"]
+              if x["borrower"] in hp.get(x["market_id"], ())]
+    by_mkt: dict[str, int] = {}
+    for m, bs in hp.items():
+        by_mkt[_mkt_name(m)] = len(bs)
+    comp = " ".join(f"{n}×{c}" for n, c in sorted(by_mkt.items(), key=lambda kv: -kv[1]))
+    top = sorted(inside, key=lambda x: -_prize_usd(x))[:3]
+    tops = ", ".join(f"{_mkt_name(x['market_id'])} {x['borrower'][:8]}… "
+                     f"приз ${_prize_usd(x):,.0f} HF={x['hf']:.4f}" for x in top)
+    print(f"  HOTSET {sum(by_mkt.values())}: {comp} | топ: {tops}")
+
+
+def _borrow_watch(rpc: Rpc, r: dict, st: dict) -> None:
+    """Алерт, когда заёмщик с призом >= порога до-занимает. Только на API-проходе: один
+    getLogs по узкому окну блоков с прошлого прохода. Никогда не роняет проход."""
+    if BORROW_WATCH_USD <= 0:
+        return
+    watch: dict[str, dict[str, float]] = {}
+    for x in r["targets"] + r["risk"]:
+        prize = _prize_usd(x)
+        if prize >= BORROW_WATCH_USD:
+            watch.setdefault(x["market_id"], {})[x["borrower"]] = prize
+    to = r["block"]
+    frm = st.get("borrow_watch_block")
+    st["borrow_watch_block"] = to
+    if not watch or frm is None or frm >= to or to - frm > BORROW_WATCH_MAX_BLOCKS:
+        return          # первый проход / разрыв окна: только переставили метку
+    try:
+        logs = get_logs_chunked(rpc, MORPHO, [TOPIC_MORPHO_BORROW], frm + 1, to,
+                                chunk=monitor.LOG_CHUNK)
+    except Exception as e:
+        print(f"  borrow-watch getLogs fail: {e}")
+        return
+    for lg in logs:
+        try:
+            d = decode_morpho_borrow(lg)
+        except Exception:
+            continue
+        prize = watch.get(d["market_id"], {}).get(d["borrower"])
+        if prize is None:
+            continue
+        alert(f"🧨 BORROW {d['borrower'][:10]}… до-занял на рынке "
+              f"{_mkt_name(d['market_id'])} — он у края, приз ~${prize:,.0f} "
+              f"(blk {d['block']} {d['tx'][:12]}…)")
 
 
 def _partial_note(coll: str, loan: str, amount_in: int) -> None:
@@ -1436,7 +1583,9 @@ def _arm_candidates(rows: list[dict]) -> list[dict]:
         cand = [r for r in rows if 1.0 <= r["hf"] < ARM_HF
                 and (r["debt_usd"] is None or r["debt_usd"] >= MIN_DEBT_USD)]
         cap = ARM_MAX_N
-    return sorted(cand, key=lambda r: -(r.get("debt_usd") or 0))[:cap]
+    # по призу, а не по долгу: кэп отсекал хвост списка, и непрайсуемые займы (debt_usd=None
+    # → 0) выпадали из пре-арма целиком — так весь кластер avKAT/KAT был невидим (30.07)
+    return sorted(cand, key=lambda r: -_prize_usd(r))[:cap]
 
 
 def _arm_refresh(rpc: Rpc, rows: list[dict], st: dict, now_ts: float,
@@ -1952,6 +2101,7 @@ def once(st: dict | None = None, mstate: dict | None = None,
     else:
         rpc = Rpc(READ_RPCS)
         refresh_eth_usd()
+        refresh_kat_usd()
     if not DRY_RUN and st.get("sent"):
         _check_pending(st, now_ts)
     if mstate is None:
@@ -2009,6 +2159,9 @@ def once(st: dict | None = None, mstate: dict | None = None,
         st["last_liq_block"] = max(st["last_liq_block"],
                                    max(lq["block"] for lq in r["liquidations"]))
 
+    if not skip_api:
+        _hotset_log(r)
+        _borrow_watch(rpc, r, st)
     ok, reason = guard_ok(st)
     print(f"[{time.strftime('%H:%M:%S')}] block {r['block']} | positions {r['n_positions']} | "
           f"near-edge {len(r['risk'])} | targets(HF<1) {len(r['targets'])} | "
@@ -2021,8 +2174,17 @@ def once(st: dict | None = None, mstate: dict | None = None,
 
     gas_usd = gas_cost_usd(rpc)
     st.setdefault("declined", {})
-    for t in sorted(r["targets"], key=lambda x: -(x["debt_usd"] or 0)):
+    for t in sorted(r["targets"], key=lambda x: -_prize_usd(x)):
         key = f"{t['market_id']}:{t['borrower']}"
+        # каскад в тонком пуле: наш предыдущий выстрел в ЭТУ же пару уже висит неподтверждённым,
+        # а любая квота слепа к невключённой транзакции — второй выстрел приедет к min-out
+        # роутера и ревертнет (доказано на форке 30.07, ошибка 0x63ecb9f6). Ждём включения:
+        # следующий проход переквотит по сдвинутому пулу. Порядок по призу гарантирует, что
+        # первым ушёл самый крупный.
+        if _pool_busy(t["coll"], t["loan"], now_ts):
+            print(f"  hold {t['borrower'][:10]}… пул {t['coll'][:8]}→{t['loan'][:8]} "
+                  f"сдвинут нашим выстрелом, переквота на следующем проходе")
+            continue
         # dedup BEFORE the per-target RPC (_shares_for_repaid) and Sushi quotes, so a skipped
         # target costs nothing — critical at hot-poll cadence with perpetual bad-debt dregs
         if recently_fired(st, key, now_ts) or recently_declined(st, key, now_ts):
@@ -2046,6 +2208,7 @@ def once(st: dict | None = None, mstate: dict | None = None,
         print(f"  target {t['borrower'][:10]}… HF={t['hf']:.4f} chunk={ev['f']:.0%} "
               f"net={nets} impact={ev['impact']*100:.2f}%")
         fire(rpc, t, ev, st, now_ts, gas_usd)
+        _pool_note(t["coll"], t["loan"], now_ts)
     # prune expired decline-cache entries so it can't grow unbounded (per-record ttl override)
     st["declined"] = {k: v for k, v in st["declined"].items()
                       if now_ts - v["ts"] < v.get("ttl", DECLINE_TTL)}
