@@ -100,8 +100,8 @@ from analysis.models import lif_from_lltv                              # noqa: E
 from analysis import monitor                                          # noqa: E402
 from analysis.monitor import scan, load_state as load_monitor_state    # noqa: E402
 from analysis.multicall import MULTICALL3                              # noqa: E402
-from analysis.protocols import (MARKETS, MORPHO, STABLES, TOKENS,      # noqa: E402
-                                TOPIC_MORPHO_BORROW, decode_morpho_borrow)
+from analysis.protocols import (MARKETS, MORPHO, STABLES, TOKENS, VAULT_EXITS,  # noqa: E402
+                                ZERO_ADDR, TOPIC_MORPHO_BORROW, decode_morpho_borrow)
 from analysis.rpc import DEFAULT_RPCS, Rpc, get_logs_chunked           # noqa: E402
 from bot import fastpath                                               # noqa: E402
 from bot import oracles                                               # noqa: E402
@@ -356,9 +356,18 @@ STATE_FILE = os.path.expanduser(os.environ.get("KT_STATE", "~/.katana-bot/exec_s
 ENV_FILE = os.path.expanduser("~/.claude/channels/telegram/.env")
 CHAT_ID = os.environ.get("KT_CHAT_ID", "")     # empty -> alerts disabled (loud preflight warn)
 
-LIQUIDATE_SELECTOR = selector(
+# v2 (30.07): последний аргумент — VaultExit{vault, asset} для ERC-4626-коллатерала.
+# Селектор ИЗМЕНИЛСЯ ⇒ адрес контракта обязан смениться вместе с ним; пока KT_CONTRACT
+# указывает на v1, эта строка не должна применяться (см. KT_CONTRACT_V2 ниже).
+LIQUIDATE_SELECTOR_V1 = selector(
     "liquidate((address,address,address,address,uint256),address,uint256,uint256,"
     "address,bytes,uint256)")
+LIQUIDATE_SELECTOR_V2 = selector(
+    "liquidate((address,address,address,address,uint256),address,uint256,uint256,"
+    "address,bytes,uint256,(address,address))")
+# Переключатель поколения контракта. Пока 0 — собираем calldata v1 бит-в-бит, как раньше.
+CONTRACT_V2 = os.environ.get("KT_CONTRACT_V2", "0") == "1"
+LIQUIDATE_SELECTOR = LIQUIDATE_SELECTOR_V2 if CONTRACT_V2 else LIQUIDATE_SELECTOR_V1
 SEL_ORACLE_PRICE = selector("price()")
 # prediction layer reads the Chainlink aggregators' latestRoundData DIRECTLY (not via multicall —
 # these access-controlled aggregators reject contract callers) to detect a push (updatedAt moves).
@@ -969,6 +978,21 @@ def _borrow_watch(rpc: Rpc, r: dict, st: dict) -> None:
               f"(blk {d['block']} {d['tx'][:12]}…)")
 
 
+SEL_PREVIEW_REDEEM = selector("previewRedeem(uint256)")
+
+
+def _preview_redeem(rpc: Rpc, vault: str, shares: int) -> int:
+    """Сколько базового токена даст redeem этих долей. Считает САМ вольт — курс меняется
+    с доходностью, и брать его из кэша реестра значило бы торговать по устаревшей цене.
+    0 при любой ошибке: лестница чанков просто пропустит ступень, а не упадёт."""
+    try:
+        ret = rpc.eth_call(vault, SEL_PREVIEW_REDEEM + f"{shares:064x}")
+        return int(ret, 16) if ret and len(ret) > 2 else 0
+    except Exception as e:
+        print(f"    previewRedeem fail {vault[:10]}…: {e}")
+        return 0
+
+
 def _partial_note(coll: str, loan: str, amount_in: int) -> None:
     k = (coll.lower(), loan.lower())
     cur = _partial_floor.get(k)
@@ -996,6 +1020,8 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = No
     `deadline_mono` (optional) caps the internal deadline — the pre-arm path runs this inside
     the idle zone and must never let a slow Sushi chain overrun the armed window."""
     loan, coll = t["loan"], t["coll"]
+    # реестр выходов через redeem; None = обычный коллатерал (путь v1 бит-в-бит)
+    vault_exit = VAULT_EXITS.get(coll.lower()) if CONTRACT_V2 else None
     loan_dec = token_decimals(rpc, loan)
     lif = lif_from_lltv(t["lltv"])
     seized_full = t["seized_assets"]
@@ -1037,7 +1063,16 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = No
         else:
             seized_arg = 0
             amount_in = seized * _HAIRCUT_NUM // _HAIRCUT_DEN
-        if _partial_known(coll, loan, amount_in):
+        # ERC-4626-коллатерал: свопится НЕ доля, а то, что даст redeem. Спрашивать маршрут
+        # «доли -> заём» бессмысленно — пула долей не существует, и именно поэтому рынки
+        # yv были для нас мертвы. previewRedeem считает вольт, а не мы.
+        swap_in, swap_amount = coll, amount_in
+        if vault_exit:
+            redeemed = _preview_redeem(rpc, vault_exit[0], amount_in)
+            if redeemed <= 0:
+                continue
+            swap_in, swap_amount = vault_exit[1], redeemed
+        if _partial_known(swap_in, loan, swap_amount):
             continue    # recent Partial at >= this size: no full route — free skip (no network),
             #             the ladder descends to a fillable fraction inside the deadline
         # arm path (deadline_mono set): cap the quote timeout to the idle budget left and take
@@ -1050,11 +1085,20 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = No
                 print("    evaluate: idle budget below one quote — not starting another")
                 break
             q_timeout, q_retries = min(QUOTE_TIMEOUT, remaining), 1
+        # база вольта совпала с займом — свопа нет вовсе (контракт его тоже пропустит)
+        if swap_in.lower() == loan.lower():
+            q = {"amount_out": swap_amount, "price_impact": 0.0,
+                 "swap_target": ZERO_ADDR, "swap_calldata": "0x"}
+            proceeds = swap_amount
+            _quote_ok = True
+        else:
+            _quote_ok = False
         try:
-            q = quote(coll, loan, amount_in,
-                      sender=CONTRACT or "0x000000000000000000000000000000000000dEaD",
-                      recipient=CONTRACT or "0x000000000000000000000000000000000000dEaD",
-                      max_slippage=MAX_SLIPPAGE, timeout=q_timeout, retries=q_retries)
+            if not _quote_ok:
+                q = quote(swap_in, loan, swap_amount,
+                          sender=CONTRACT or "0x000000000000000000000000000000000000dEaD",
+                          recipient=CONTRACT or "0x000000000000000000000000000000000000dEaD",
+                          max_slippage=MAX_SLIPPAGE, timeout=q_timeout, retries=q_retries)
         except NoRouteError:
             # no route at any size (dead/exotic collateral, e.g. yUSD) — skip this target
             return None
@@ -1063,7 +1107,7 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = No
             # the floor so this and larger fractions are skipped for DECLINE_TTL and the ladder
             # spends its budget on sizes that can actually fill. The partial output is NEVER
             # treated as a full fill (no row is built from this quote).
-            _partial_note(coll, loan, amount_in)
+            _partial_note(swap_in, loan, swap_amount)
             print(f"    quote partial f={num}/{den}: {e} (size cached {DECLINE_TTL:.0f}s)")
             if time.monotonic() > deadline:
                 print("    evaluate deadline exceeded, giving up this pass")
@@ -1122,6 +1166,11 @@ def liquidate_calldata(t: dict, ev: dict) -> str:
     args = [mp, _cs(t["borrower"]), ev.get("seized_arg", 0), ev["repaid_shares"],
             _cs(ev["swap_target"]), bytes.fromhex(ev["swap_calldata"][2:]),
             ev["min_profit_wei"]]
+    if CONTRACT_V2:
+        # VaultExit: нули = обычный коллатерал (путь v1 внутри контракта бит-в-бит)
+        vault, asset = VAULT_EXITS.get(t["coll"].lower(), (ZERO_ADDR, ZERO_ADDR))
+        types = types + ["(address,address)"]
+        args = args + [(_cs(vault), _cs(asset))]
     return LIQUIDATE_SELECTOR + encode(types, args).hex()
 
 

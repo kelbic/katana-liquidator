@@ -18,7 +18,7 @@ os.environ.setdefault("KT_MAX_IMPACT", "0.02")
 os.environ.setdefault("KT_CONTRACT", "0x000000000000000000000000000000000000bEEF")
 
 from analysis import monitor  # noqa: E402
-from analysis.protocols import MARKETS, TOKENS  # noqa: E402
+from analysis.protocols import MARKETS, TOKENS, ZERO_ADDR  # noqa: E402
 from bot import executor as ex  # noqa: E402
 from bot.mempool import OracleSignal  # noqa: E402
 
@@ -2841,3 +2841,99 @@ class TestRateWatch(unittest.TestCase):
                   {"targets": [], "risk": [self._row("0xzz")], "rates": {"0xzz": 0},
                    "prices": {"0xzz": 0}}):
             ex._rate_watch(r, {}, 0.0)
+
+
+class TestVaultExitPath(unittest.TestCase):
+    """v2: у долей yv-вольта НЕТ пула на Sushi — маршрут не существует в принципе, и рынки
+    yvvbUSDC/vbUSDT, yvvbUSDT/vbUSDC были для нас мертвы ($48.4k приза, реализуемо $28.8k).
+    Свопится не доля, а то, что даст redeem; сколько именно — считает вольт, не мы."""
+
+    YV = "0x80c34bd3a3569e126e7055831036aa7b212cb159"          # yvvbUSDC
+    ASSET = TOKENS["vbUSDC"]["address"]
+
+    class _Rpc:
+        def __init__(self, redeemed):
+            self.redeemed, self.calls = redeemed, []
+
+        def eth_call(self, to, data, tag="latest", gas=None):
+            self.calls.append((to.lower(), data[:10]))
+            if data.startswith(ex.SEL_PREVIEW_REDEEM):
+                return "0x" + f"{self.redeemed:064x}"
+            return "0x" + f"{6:064x}"          # decimals()
+
+    def _target(self, coll, loan=None):
+        return {"loan": loan or TOKENS["vbUSDT"]["address"], "coll": coll,
+                "oracle": "0x" + "11" * 20, "irm": "0x" + "22" * 20,
+                "lltv": 860000000000000000, "borrower": "0x" + "33" * 20,
+                "market_id": "0x" + "44" * 32,
+                "debt_assets": 1_000 * 10 ** 6, "repaid_assets": 1_000 * 10 ** 6,
+                "seized_assets": 1_100 * 10 ** 6, "borrow_shares_repaid": 10 ** 15,
+                "price": 10 ** 36, "collateral": 2_000 * 10 ** 6}
+
+    def test_calldata_v1_unchanged_by_default(self):
+        self.assertFalse(ex.CONTRACT_V2)
+        self.assertEqual(ex.LIQUIDATE_SELECTOR, ex.LIQUIDATE_SELECTOR_V1)
+        self.assertNotEqual(ex.LIQUIDATE_SELECTOR_V1, ex.LIQUIDATE_SELECTOR_V2)
+
+    def test_calldata_v2_appends_vault_exit(self):
+        save_sel, save_v2 = ex.LIQUIDATE_SELECTOR, ex.CONTRACT_V2
+        try:
+            ex.CONTRACT_V2, ex.LIQUIDATE_SELECTOR = True, ex.LIQUIDATE_SELECTOR_V2
+            ev = {"seized_arg": 0, "repaid_shares": 1, "swap_target": "0x" + "55" * 20,
+                  "swap_calldata": "0xabcd", "min_profit_wei": 7}
+            cd_v = ex.liquidate_calldata(self._target(self.YV), ev)
+            cd_n = ex.liquidate_calldata(self._target("0x" + "66" * 20), ev)
+            self.assertTrue(cd_v.startswith(ex.LIQUIDATE_SELECTOR_V2))
+            # адрес вольта обязан присутствовать в calldata, у обычного коллатерала — нули
+            self.assertIn(self.YV[2:], cd_v.lower())
+            self.assertIn(self.ASSET[2:].lower(), cd_v.lower())
+            self.assertNotIn(self.YV[2:], cd_n.lower())
+            self.assertGreater(len(cd_v), len(cd_n) - 2)
+        finally:
+            ex.CONTRACT_V2, ex.LIQUIDATE_SELECTOR = save_v2, save_sel
+
+    def _eval_with(self, coll, redeemed, quote_fn, loan=None):
+        rpc = self._Rpc(redeemed)
+        save_q, save_v2 = ex.quote, ex.CONTRACT_V2
+        try:
+            ex.CONTRACT_V2, ex.quote = True, quote_fn
+            ev = ex.evaluate(rpc, self._target(coll, loan), gas_usd=0.01)
+        finally:
+            ex.quote, ex.CONTRACT_V2 = save_q, save_v2
+        return ev, rpc
+
+    def test_quote_asks_for_the_redeemed_asset_not_the_shares(self):
+        seen = {}
+
+        def q(tin, tout, amt, **kw):
+            seen.update(token_in=tin.lower(), amount_in=amt)
+            return {"amount_out": 1_200 * 10 ** 6, "price_impact": 0.001,
+                    "swap_target": "0x" + "55" * 20, "swap_calldata": "0xabcd"}
+
+        ev, rpc = self._eval_with(self.YV, 1_150 * 10 ** 6, q)
+        self.assertIsNotNone(ev)
+        self.assertEqual(seen["token_in"], self.ASSET.lower())     # не доли!
+        self.assertEqual(seen["amount_in"], 1_150 * 10 ** 6)       # ровно previewRedeem
+        self.assertTrue(any(c[1] == ex.SEL_PREVIEW_REDEEM for c in rpc.calls))
+
+    def test_no_swap_when_vault_asset_is_the_loan(self):
+        def q(*a, **k):
+            self.fail("своп не должен запрашиваться, когда база вольта = заём")
+
+        ev, _ = self._eval_with(self.YV, 1_150 * 10 ** 6, q, loan=self.ASSET)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["proceeds"], 1_150 * 10 ** 6)
+        self.assertEqual(ev["swap_target"], ZERO_ADDR)
+
+    def test_zero_preview_skips_the_rung_without_crashing(self):
+        ev, _ = self._eval_with(self.YV, 0, lambda *a, **k: self.fail("не должно дойти до свопа"))
+        self.assertIsNone(ev)
+
+    def test_ordinary_collateral_never_calls_preview_redeem(self):
+        def q(tin, tout, amt, **kw):
+            return {"amount_out": 1_200 * 10 ** 6, "price_impact": 0.001,
+                    "swap_target": "0x" + "55" * 20, "swap_calldata": "0xabcd"}
+
+        ev, rpc = self._eval_with("0x" + "66" * 20, 0, q)
+        self.assertIsNotNone(ev)
+        self.assertFalse(any(c[1] == ex.SEL_PREVIEW_REDEEM for c in rpc.calls))

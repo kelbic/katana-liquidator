@@ -43,6 +43,20 @@ TOKENS = {
 ADDR_TO_SYMBOL = {v["address"].lower(): k for k, v in TOKENS.items()}
 
 # Stablecoin loan tokens (USD ≈ 1) — USD sizing of debt is reliable here.
+# --- ERC-4626-коллатерал: выход через redeem, а не через своп ---------------------------
+# У долей yv-вольта НЕТ пула на Sushi — маршрут не существует в принципе, и рынки
+# yvvbUSDC/vbUSDT и yvvbUSDT/vbUSDC были для нас мертвы ($48.4k приза, 30.07). Выход:
+# redeem(доли) -> базовый токен -> обычный своп в заём. Реестр статический И СВЕРЯЕТСЯ
+# ОН-ЧЕЙН контрактом (asset()), поэтому ошибка здесь ревертит выстрел, а не крадёт деньги.
+# Проверено 30.07: оба честные ERC-4626, база $10.1M и $2.6M, курс 1.0241 и 1.0225.
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+VAULT_EXITS = {
+    "0x80c34bd3a3569e126e7055831036aa7b212cb159": (          # yvvbUSDC
+        "0x80c34bd3a3569e126e7055831036aa7b212cb159", TOKENS["vbUSDC"]["address"]),
+    "0x9a6bd7b6fd5c4f87eb66356441502fc7dcdd185b": (          # yvvbUSDT
+        "0x9a6bd7b6fd5c4f87eb66356441502fc7dcdd185b", TOKENS["vbUSDT"]["address"]),
+}
+
 STABLES = {TOKENS["vbUSDC"]["address"].lower(), TOKENS["vbUSDT"]["address"].lower(),
            TOKENS["AUSD"]["address"].lower()}
 
