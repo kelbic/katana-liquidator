@@ -205,5 +205,34 @@ class TestTransientAndPassDeadline(PoolTestCase):
         self.assertIsNone(self._rpc().deadline)
 
 
+class TestChunkerBounded(unittest.TestCase):
+    """04.08 (и, по сигнатуре, 01.08): get_logs_chunked ловил PassDeadlineExceeded как
+    RuntimeError и ретраил то же окно. call() с истёкшим дедлайном кидает ДО сети —
+    мгновенно — и `continue` превращался в вечный CPU-спин главного цикла при живом
+    процессе (mtime лога держали фоновые треды). Плюс: у пола chunk (1000) любой
+    персистентный отказ окна >1 блока ретраился бесконечно даже без дедлайна."""
+
+    class _FakeRpc:
+        def __init__(self, exc):
+            self.exc, self.calls = exc, 0
+
+        def get_logs(self, address, topics, lo, hi):
+            self.calls += 1
+            raise self.exc
+
+    def test_pass_deadline_escapes_immediately(self):
+        r = self._FakeRpc(rpc_mod.PassDeadlineExceeded("pass deadline exceeded"))
+        with self.assertRaises(rpc_mod.PassDeadlineExceeded):
+            rpc_mod.get_logs_chunked(r, "0x0", [], 0, 1999, chunk=50_000)
+        self.assertEqual(r.calls, 1)     # ни одного повтора: бюджет прохода мёртв
+
+    def test_floor_chunk_retries_are_bounded(self):
+        r = self._FakeRpc(rpc_mod.RpcError(-32603, "block range is too large"))
+        with self.assertRaises(rpc_mod.RpcError):
+            rpc_mod.get_logs_chunked(r, "0x0", [], 0, 99_999, chunk=100_000)
+        # деления 100k->1000 (~7) + <=3 повтора у пола, а не бесконечность
+        self.assertLess(r.calls, 15)
+
+
 if __name__ == "__main__":
     unittest.main()

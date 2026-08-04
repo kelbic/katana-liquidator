@@ -317,6 +317,10 @@ class TestChunkDescent(unittest.TestCase):
         self.assertTrue(all(f >= 25.0 / 2000.0 for f in tail2))
         # unpriceable loan: no economic bound -> no descent at all
         self.assertEqual(list(ex._chunk_fractions(None, 5.0)), list(ex.CHUNK_FRACTIONS))
+        # NaN prize (сломанный прайс-фид): NaN truthy, а `num/den < NaN` всегда False —
+        # без явного гарда генератор бесконечен (аналог спин-класса 01.08/04.08)
+        self.assertEqual(list(ex._chunk_fractions(float("nan"), 5.0)),
+                         list(ex.CHUNK_FRACTIONS))
 
     def test_descent_never_starts_a_quote_past_the_deadline(self):
         calls = {"n": 0}

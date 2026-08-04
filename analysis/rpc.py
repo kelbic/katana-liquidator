@@ -249,19 +249,31 @@ def get_logs_chunked(rpc: Rpc, address, topics, from_block: int, to_block: int,
     """getLogs over a big range in fixed windows; halves the window on limit errors."""
     out = []
     lo = from_block
+    floor_fails = 0
     while lo <= to_block:
         hi = min(lo + chunk - 1, to_block)
         try:
             logs = rpc.get_logs(address, topics, lo, hi)
+        except PassDeadlineExceeded:
+            # Бюджет прохода мёртв — деление окна не поможет: call() кидает ДО сети, мгновенно,
+            # и `continue` здесь превращался в вечный чистый CPU-спин главного цикла при живых
+            # фоновых тредах (инциденты 01.08 и 04.08 — сканер молчит, процесс жжёт ядро).
+            raise
         except (RpcError, http.client.IncompleteRead, RuntimeError):
             # RpcError = explicit "range too large"; IncompleteRead/RuntimeError = the public
             # Katana RPC truncated a big chunked response (or call() exhausted retries on it).
-            # In every case, retry a smaller window before giving up.
+            # In every case, retry a smaller window before giving up — BOUNDEDLY: у пола chunk
+            # тот же запрос раньше повторялся бесконечно.
             if hi > lo:
-                chunk = max(1000, chunk // 2)
-                continue
+                if chunk > 1000:
+                    chunk = max(1000, chunk // 2)
+                    continue
+                floor_fails += 1
+                if floor_fails <= 3:
+                    continue
             raise
         out.extend(logs)
+        floor_fails = 0
         if on_progress:
             on_progress(hi, to_block, len(out))
         lo = hi + 1

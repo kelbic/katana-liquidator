@@ -438,8 +438,10 @@ def _chunk_fractions(full_prize_usd: float | None, gas_usd: float):
     exact-int range, and sizing must stay exact integer math (review C1)."""
     for num, den in CHUNK_FRACTIONS:
         yield num, den
-    if not full_prize_usd or full_prize_usd <= 0:
-        return          # unpriceable loan: no economic bound to descend inside, so don't descend
+    if not full_prize_usd or full_prize_usd <= 0 or full_prize_usd != full_prize_usd:
+        return          # unpriceable loan (None/0/NaN): no economic bound to descend inside, so
+        #                 don't descend. NaN отдельно: он truthy и все сравнения с ним False —
+        #                 без этой ветки f_lo = NaN и `num/den < f_lo` не остановит descent никогда
     f_lo = max((MIN_PROFIT_USD + gas_usd) / full_prize_usd, MIN_CHUNK_FRACTION)
     num, den = CHUNK_FRACTIONS[-1]
     while True:
