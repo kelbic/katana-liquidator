@@ -661,6 +661,23 @@ def _loan_usd_px(addr: str) -> float | None:
     return None
 
 
+# Пропуск по нецененному займу печатается РЕДКО (раз в DECLINE_TTL на токен): цель
+# переоценивается каждый проход, а строка нужна как ЗАДАЧА («заведи цену этого токена, если
+# рынок стоит того»), не как поток. Именованный предел обязан быть виден — «no profitable
+# chunk» здесь солгало бы: чанк может быть сколь угодно жирным, мы просто не умеем его
+# оценить. Ключ — адрес токена, поэтому новый рынок с тем же займом не даёт нового шума.
+_unpriced_until: dict[str, float] = {}
+
+
+def _unpriced_note(loan: str) -> None:
+    now = time.monotonic()
+    if _unpriced_until.get(loan.lower(), 0.0) > now:
+        return
+    _unpriced_until[loan.lower()] = now + DECLINE_TTL
+    print(f"    skip: НЕЦЕНЕНЫЙ заём {loan} — огонь закрыт "
+          f"(нет ни ${MIN_PROFIT_USD:g}-порога, ни вычета газа)")
+
+
 # --- competitor-race prize (the on-the-table bonus of a race we did NOT win) ----------------
 _MARKET_BY_ID = {m["id"].lower(): m for m in MARKETS.values()}
 _MKT_NAME = {v["id"].lower(): k for k, v in MARKETS.items()}
@@ -1045,6 +1062,21 @@ def evaluate(rpc: Rpc, t: dict, gas_usd: float, deadline_mono: float | None = No
     if seized_full <= 0 or (not capped and shares_full <= 0):
         return None
     loan_px = _loan_usd_px(loan)
+    # НЕЦЕНЕНЫЙ ЗАЁМ ЗАКРЫВАЕТ ОГОНЬ. Отсутствие цены РАСПУСКАЛО обе денежные защиты разом:
+    # usd_floor_wei падал до 1 wei, а net_usd становился None — и проверка `net_usd >=
+    # MIN_PROFIT_USD`, ЕДИНСТВЕННАЯ, где вычитается газ, просто не выполнялась. Порог $20 и
+    # учёт газа исчезали молча, оставляя условие «любой положительный net_wei» (08.08: три
+    # боевых выстрела на авто-обнаруженном yvvbUSDT/dUSD, излишек $0.0006/$0.0002/$0.00002
+    # против $0.19 газа за штуку — вся боевая история бота была убыточной).
+    # Незнание обязано УЖЕСТОЧАТЬ гард, а не ослаблять его: цену вывести не из чего (квота
+    # даёт единицы займа, не доллары), значит единственный корректный ответ — не стрелять.
+    # Реестровые рынки не задеты: у каждого займ прайсуется ($1 / ETH_USD / KAT_USD, оба
+    # refresh при отказе СОХРАНЯЮТ прежнее значение и имеют ненулевой seed) — пришпилено
+    # тестом test_every_registry_market_loan_is_priceable. Цель из книги НЕ выпадает
+    # (ранжирование и вотчеры фейлятся открыто намеренно) — закрыт ровно выстрел.
+    if not loan_px or loan_px != loan_px:          # None / 0.0 / NaN
+        _unpriced_note(loan)
+        return None
     # USD profit floor converted into loan wei (stables: $1/token as before; vbETH via ETH_USD)
     usd_floor_wei = max(1, int(MIN_PROFIT_USD / loan_px * 10 ** loan_dec)) if loan_px else 1
     # Full prize of a complete close, in USD, with NO network call: in a Morpho close

@@ -140,6 +140,127 @@ class TestEvaluate(unittest.TestCase):
         self.assertLessEqual(ev["repaid_shares"], shares)
 
 
+class TestUnpricedLoanClosesFire(unittest.TestCase):
+    """Регрессия 08.08 на БОЕВЫХ числах: нецененный заём распускал обе денежные защиты.
+
+    Фикстура — ровно tx 0xe824764e (блок 39414047, авто-обнаруженный рынок yvvbUSDT/dUSD;
+    dUSD в реестре цен НЕТ): seized/repaid/shares/price взяты из события Morpho Liquidate,
+    proceeds — из настоящего Transfer'а выхода свопа, курс вольта — из пары Transfer'ов
+    redeem. Дефект: usd_floor_wei падал до 1 wei, net_usd становился None (и потому
+    проверка `net_usd >= MIN_PROFIT_USD`, ЕДИНСТВЕННАЯ, где вычитается газ, не выполнялась),
+    выстрел уходил при излишке $0.0006 против $0.19 газа."""
+
+    DUSD = "0xca52d08737e6af8763a2bf6034b3b03868f24dda"        # dTRINITY USD, 18 dec
+    YVVBUSDT = "0x9a6bd7b6fd5c4f87eb66356441502fc7dcdd185b"    # yvvbUSDT, 6 dec (ERC4626)
+    SEIZED = 15464                       # Liquidate.seizedAssets
+    REPAID = 15145357372226531           # Liquidate.repaidAssets (18 dec)
+    SHARES = 14129276532925579490309     # Liquidate.repaidShares
+    PRICE = 1022311974200000000000000000000000000000000000000
+    REDEEMED = 15820                     # vbUSDT, полученные redeem'ом 15464 долей
+    SWAP_IN = 15772                      # вход свопа после haircut 0.3%
+    PROCEEDS = 15761628847779425         # реальный выход свопа -> контракт (18 dec)
+    VBETH = TOKENS["vbETH"]["address"]   # прайсуемый 18-значный заём для контроля
+
+    def _target(self, loan=None):
+        return {"market_id": "0x65b7a881353930bc15c30b10c40d7249f1d569145c96108780440ae4070"
+                             "a9578",
+                "borrower": "0xe5f9d86522940ae8efb72c1a5d691e0a441b8ca5",
+                "loan": loan or self.DUSD, "coll": self.YVVBUSDT,
+                "oracle": "0x5bcd1575388a3cb5651ebc4a285beb972265c9aa",
+                "irm": "0x4F708C0ae7deD3d74736594C2109C2E3c065B428",
+                "lltv": 860000000000000000, "hf": 1.0,
+                "debt_assets": self.REPAID, "repaid_assets": self.REPAID,
+                "seized_assets": self.SEIZED, "borrow_shares_repaid": self.SHARES,
+                "price": self.PRICE}
+
+    def setUp(self):
+        self._save = (ex.quote, ex.CONTRACT_V2, ex._preview_redeem)
+        ex.CONTRACT_V2 = True                       # боевая конфигурация (KT_CONTRACT_V2=1)
+        ex._unpriced_until.clear()
+        ex._partial_floor.clear()
+        self.calls = {"n": 0}
+        # курс вольта из боевой tx: 15464 долей -> 15820 vbUSDT
+        ex._preview_redeem = lambda rpc, vault, sh: sh * self.REDEEMED // self.SEIZED
+
+        def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005, **kw):
+            self.calls["n"] += 1
+            return {"amount_out": self.PROCEEDS * amount_in_wei // self.SWAP_IN,
+                    "price_impact": 0.0003, "gas": 400000,
+                    "swap_target": "0xAC4c6e212A361c968F1725b4d055b47E63F80b75",
+                    "swap_calldata": "0xbeef"}
+        ex.quote = q
+
+    def tearDown(self):
+        ex.quote, ex.CONTRACT_V2, ex._preview_redeem = self._save
+        ex._unpriced_until.clear()
+        ex._partial_floor.clear()
+
+    def test_real_losing_fire_is_now_refused_before_any_quote(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ev = ex.evaluate(None, self._target(), gas_usd=0.19)
+        self.assertIsNone(ev)
+        self.assertEqual(self.calls["n"], 0)        # гард СТОИТ ВЫШЕ сети, а не после неё
+        self.assertIn("НЕЦЕНЕНЫЙ", buf.getvalue())
+        self.assertIn(self.DUSD, buf.getvalue())    # именованный предел: видно, что заводить
+
+    def test_same_fixture_with_a_priced_loan_reaches_the_ladder_and_refuses_honestly(self):
+        """Позитивный контроль НА ТОМ ЖЕ объекте: None выше — не артефакт фикстуры.
+        Меняем ТОЛЬКО адрес займа на прайсуемый 18-значный (vbETH) — evaluate доходит до
+        квоты и отказывает по ЧЕСТНОЙ причине: излишек не берёт $20-порог с вычетом газа."""
+        t = self._target(loan=self.VBETH)
+        with contextlib.redirect_stdout(io.StringIO()):
+            ev = ex.evaluate(None, t, gas_usd=0.19)
+        self.assertIsNone(ev)
+        self.assertGreater(self.calls["n"], 0)      # квота ВЫЗЫВАЛАСЬ — путь живой
+
+    def test_priced_loan_with_a_fat_exit_still_fires(self):
+        """Вторая половина контроля: ладдер не «сломан в None» — на том же таргете с жирным
+        выходом выстрел проходит, значит отказ выше вызван экономикой, а не поломкой."""
+        t = self._target(loan=self.VBETH)
+        fat = self.REPAID + 2 * 10 ** 16            # +0.02 vbETH излишка
+
+        def q(token_in, token_out, amount_in_wei, sender, recipient, max_slippage=0.005, **kw):
+            self.calls["n"] += 1
+            return {"amount_out": fat, "price_impact": 0.0003, "gas": 400000,
+                    "swap_target": "0xAC4c6e212A361c968F1725b4d055b47E63F80b75",
+                    "swap_calldata": "0xbeef"}
+        ex.quote = q
+        with contextlib.redirect_stdout(io.StringIO()):
+            ev = ex.evaluate(None, t, gas_usd=0.19)
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev["f"], 1.0)
+        self.assertGreater(ev["net_usd"], ex.MIN_PROFIT_USD)
+
+    def test_zero_and_nan_price_are_unpriced_too(self):
+        """0.0 и NaN — не «цена»: старое `if loan_px else 1` роняло 0.0 в ту же дыру, а NaN
+        truthy и все сравнения с ним False, то есть порог не удержал бы ничего."""
+        for bad in (0.0, float("nan")):
+            ex._unpriced_until.clear()
+            self.calls["n"] = 0
+            with mock.patch.object(ex, "_loan_usd_px", return_value=bad):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertIsNone(ex.evaluate(None, self._target(loan=self.VBETH),
+                                                  gas_usd=0.19))
+            self.assertEqual(self.calls["n"], 0)
+
+    def test_note_is_deduped_per_token(self):
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            for _ in range(5):
+                ex.evaluate(None, self._target(), gas_usd=0.19)
+        self.assertEqual(buf.getvalue().count("НЕЦЕНЕНЫЙ"), 1)
+
+    def test_every_registry_market_loan_is_priceable(self):
+        """Инвариант, ради которого fail-closed безопасен: НИ ОДИН рынок из реестра не может
+        попасть под этот отказ. ETH_USD/KAT_USD имеют ненулевой seed и при отказе refresh
+        СОХРАНЯЮТ прежнее значение, поэтому проверка честна и в рантайме."""
+        for name, m in MARKETS.items():
+            addr = TOKENS[m["loan"]]["address"]
+            px = ex._loan_usd_px(addr)
+            self.assertTrue(px and px == px, f"{name}: заём {m['loan']} непрайсуем -> "
+                                             f"fail-closed погасил бы боевой рынок")
+
+
 class TestArmQuoteTimeoutCap(unittest.TestCase):
     """Small fix: an arm-path quote (deadline_mono set) must cap its Sushi timeout to the
     REMAINING idle budget and single-shot it, so a slow/Partial quote can't eat the armed
